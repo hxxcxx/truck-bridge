@@ -39,6 +39,9 @@ impl TruckError {
 }
 
 /// Result of a guarded FFI body: success value, or an owning error handle.
+/// Kept as a named type so the contract reads uniformly across modules even
+/// though the `truck_guard!` macro currently inlines it.
+#[allow(dead_code)]
 pub(crate) type GuardResult<T> = Result<T, *mut TruckError>;
 
 /// Wrap an `extern "C"` body so a panic becomes a [`TruckError`] instead of
@@ -85,7 +88,7 @@ pub(crate) fn panic_to_string(payload: &Box<dyn std::any::Any + Send>) -> String
     // `payload` is `&Box<dyn Any + Send>`; reach the inner `dyn Any` so the
     // downcasts below match the value the panic was constructed with, not the
     // Box wrapper itself.
-    let any: &(dyn Any) = &**payload;
+    let any: &dyn Any = &**payload;
     if let Some(s) = any.downcast_ref::<&'static str>() {
         format!("internal panic: {}", s)
     } else if let Some(s) = any.downcast_ref::<String>() {

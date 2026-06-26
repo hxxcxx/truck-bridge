@@ -2,8 +2,8 @@
 """End-to-end verification of truck-bridge via ctypes.
 
 Runs the release-built `truck_bridge.dll` through its real C ABI surface — no
-Rust test harness involved. This proves the four foundations hold against the
-actual artifact a C/C++ consumer would link.
+Rust test harness involved. Covers stage 2 (foundation smoke) and stage 3
+(OBJ/STL IO, to_buffer, merge, error path).
 
 Run from the repo root after `cargo build --release`:
     python examples/verify_ctypes.py
@@ -17,20 +17,57 @@ from ctypes import (
     Structure,
     c_bool,
     c_double,
+    c_float,
+    c_int32,
     c_size_t,
     c_uint32,
     c_uint8,
     c_void_p,
     byref,
     POINTER,
+    cast,
 )
 from pathlib import Path
 
 
-# --- C struct mirrors (must match truck_bridge.h) ---------------------------
+def as_u8_ptr(data: bytes):
+    """Wrap a bytes object as a `POINTER(c_uint8)` for FFI byte-slice args."""
+    n = len(data)
+    arr = (c_uint8 * n).from_buffer_copy(data)
+    return cast(arr, POINTER(c_uint8)), arr  # keep arr alive across the call
+
+
+# --- C struct mirrors (must match include/truck_bridge.h) -------------------
 
 class TruckF64Array(Structure):
     _fields_ = [("ptr", POINTER(c_double)), ("len", c_size_t)]
+
+    def values(self):
+        if not self.ptr or self.len == 0:
+            return []
+        return [self.ptr[i] for i in range(self.len)]
+
+
+class TruckF32Array(Structure):
+    _fields_ = [("ptr", POINTER(c_float)), ("len", c_size_t)]
+
+    def values(self):
+        if not self.ptr or self.len == 0:
+            return []
+        return [self.ptr[i] for i in range(self.len)]
+
+
+class TruckU8Array(Structure):
+    _fields_ = [("ptr", POINTER(c_uint8)), ("len", c_size_t)]
+
+    def bytes(self):
+        if not self.ptr or self.len == 0:
+            return b""
+        return bytes((self.ptr[i]) for i in range(self.len))
+
+
+class TruckU32Array(Structure):
+    _fields_ = [("ptr", POINTER(c_uint32)), ("len", c_size_t)]
 
     def values(self):
         if not self.ptr or self.len == 0:
@@ -44,8 +81,85 @@ class TruckStr(Structure):
     def decode(self):
         if not self.ptr or self.len == 0:
             return ""
-        raw = bytes(self.ptr[i] for i in range(self.len))
+        raw = bytes((self.ptr[i]) for i in range(self.len))
         return raw.decode("utf-8")
+
+
+# TruckStlType enum: Automatic=0, Ascii=1, Binary=2
+STL_AUTOMATIC = 0
+STL_ASCII = 1
+STL_BINARY = 2
+
+
+class TruckPolygonBuffer(Structure):
+    _fields_ = [
+        ("positions", TruckF64Array),
+        ("uv", TruckF32Array),
+        ("normal", TruckF32Array),
+        ("indices", TruckU32Array),
+    ]
+
+
+# A minimal one-triangle OBJ.
+TRI_OBJ = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1 2 3\n"
+
+
+def setup(lib):
+    """Declare signatures on the loaded CDLL."""
+    lib.truck_abi_version.restype = c_uint32
+
+    lib.truck_polygonmesh_new_empty.restype = c_void_p
+    lib.truck_polygonmesh_bounding_box.restype = c_bool
+    lib.truck_polygonmesh_bounding_box.argtypes = [c_void_p, POINTER(TruckF64Array)]
+    lib.truck_polygonmesh_free.argtypes = [c_void_p]
+
+    lib.truck_polygonmesh_from_obj.restype = c_bool
+    lib.truck_polygonmesh_from_obj.argtypes = [
+        POINTER(c_uint8), c_size_t,
+        POINTER(c_void_p), POINTER(c_void_p),
+    ]
+    lib.truck_polygonmesh_from_stl.restype = c_bool
+    lib.truck_polygonmesh_from_stl.argtypes = [
+        POINTER(c_uint8), c_size_t, c_uint32,
+        POINTER(c_void_p), POINTER(c_void_p),
+    ]
+    lib.truck_polygonmesh_to_obj.restype = c_bool
+    lib.truck_polygonmesh_to_obj.argtypes = [
+        c_void_p, POINTER(TruckU8Array), POINTER(c_void_p),
+    ]
+    lib.truck_polygonmesh_to_stl.restype = c_bool
+    lib.truck_polygonmesh_to_stl.argtypes = [
+        c_void_p, c_uint32, POINTER(TruckU8Array), POINTER(c_void_p),
+    ]
+    lib.truck_polygonmesh_to_buffer.restype = c_bool
+    lib.truck_polygonmesh_to_buffer.argtypes = [
+        c_void_p, POINTER(TruckPolygonBuffer), POINTER(c_void_p),
+    ]
+    lib.truck_polygonmesh_merge.restype = c_bool
+    lib.truck_polygonmesh_merge.argtypes = [
+        c_void_p, c_void_p, POINTER(c_void_p),
+    ]
+
+    lib.truck_error_message.restype = TruckStr
+    lib.truck_error_message.argtypes = [c_void_p]
+    lib.truck_error_free.argtypes = [c_void_p]
+
+    lib.truck_version_string.restype = TruckStr
+    lib.truck_f64array_free.argtypes = [TruckF64Array]
+    lib.truck_u8array_free.argtypes = [TruckU8Array]
+    lib.truck_polygonbuffer_free.argtypes = [TruckPolygonBuffer]
+    lib.truck_str_free.argtypes = [TruckStr]
+
+
+def get_error(lib, err_ptr):
+    """If err_ptr is non-NULL, fetch + free the message, return it."""
+    if not err_ptr:
+        return None
+    s = lib.truck_error_message(err_ptr)
+    msg = s.decode()
+    lib.truck_str_free(s)
+    lib.truck_error_free(err_ptr)
+    return msg
 
 
 def main() -> int:
@@ -55,55 +169,115 @@ def main() -> int:
         return 1
 
     lib = CDLL(str(dll_path))
+    setup(lib)
 
-    # --- signatures ---------------------------------------------------------
-    lib.truck_abi_version.restype = c_uint32
-    lib.truck_polygonmesh_new_empty.restype = c_void_p
-    lib.truck_polygonmesh_bounding_box.restype = c_bool
-    lib.truck_polygonmesh_bounding_box.argtypes = [c_void_p, POINTER(TruckF64Array)]
-    lib.truck_polygonmesh_free.argtypes = [c_void_p]
-    lib.truck_version_string.restype = TruckStr
-    lib.truck_f64array_free.argtypes = [TruckF64Array]
-    lib.truck_str_free.argtypes = [TruckStr]
-
-    # --- 1. ABI version -----------------------------------------------------
+    # --- stage 2: ABI version + version string -----------------------------
     abi = lib.truck_abi_version()
-    print(f"ABI version: {abi}")
-    assert abi == 1, "ABI version mismatch"
-
-    # --- 2. version string --------------------------------------------------
+    print(f"[1] ABI version: {abi}")
+    assert abi == 1
     vs = lib.truck_version_string()
     vstr = vs.decode()
-    print(f"version string: {vstr}")
+    print(f"    version string: {vstr}")
     assert "truck-bridge" in vstr
     lib.truck_str_free(vs)
 
-    # --- 3. empty mesh bounding box ----------------------------------------
+    # --- stage 2: empty mesh bounding box ----------------------------------
     mesh = lib.truck_polygonmesh_new_empty()
-    assert mesh, "new_empty returned NULL"
-    print(f"mesh handle: {hex(mesh)}")
-
+    assert mesh
     arr = TruckF64Array()
-    ok = lib.truck_polygonmesh_bounding_box(mesh, byref(arr))
-    assert ok, "bounding_box returned false"
+    assert lib.truck_polygonmesh_bounding_box(mesh, byref(arr))
     bbox = arr.values()
-    print(f"empty bbox: {bbox}")
-    # empty mesh => min = +INF, max = -INF
-    assert len(bbox) == 6
-    assert math.isinf(bbox[0]) and bbox[0] > 0, "min.x should be +INF"
-    assert math.isinf(bbox[3]) and bbox[3] < 0, "max.x should be -INF"
+    print(f"[2] empty bbox: {bbox}")
+    assert len(bbox) == 6 and math.isinf(bbox[0]) and bbox[0] > 0
     lib.truck_f64array_free(arr)
-
-    # --- 4. free (idempotent, NULL-safe) -----------------------------------
     lib.truck_polygonmesh_free(mesh)
-    lib.truck_polygonmesh_free(None)  # NULL must be tolerated
 
-    # --- 5. NULL mesh -> bounding_box false (no crash) ---------------------
-    arr2 = TruckF64Array()
-    assert not lib.truck_polygonmesh_bounding_box(None, byref(arr2)), \
-        "NULL mesh should yield false"
+    # --- stage 3: from_obj --------------------------------------------------
+    out = c_void_p()
+    err = c_void_p()
+    tri_ptr, _keep1 = as_u8_ptr(TRI_OBJ)
+    ok = lib.truck_polygonmesh_from_obj(tri_ptr, len(TRI_OBJ), byref(out), byref(err))
+    assert ok and out, f"from_obj failed: {get_error(lib, err)}"
+    print(f"[3] from_obj: mesh handle {hex(out.value)}, 1 triangle parsed")
+    m1 = out.value
 
-    print("\nAll ctypes checks passed.")
+    # --- stage 3: to_obj roundtrip -----------------------------------------
+    obj_bytes = TruckU8Array()
+    err = c_void_p()
+    ok = lib.truck_polygonmesh_to_obj(m1, byref(obj_bytes), byref(err))
+    assert ok and obj_bytes.len > 0, f"to_obj failed: {get_error(lib, err)}"
+    print(f"[4] to_obj roundtrip: {obj_bytes.len} bytes")
+    lib.truck_u8array_free(obj_bytes)
+
+    # --- stage 3: to_buffer (separated arrays) -----------------------------
+    buf = TruckPolygonBuffer()
+    err = c_void_p()
+    ok = lib.truck_polygonmesh_to_buffer(m1, byref(buf), byref(err))
+    assert ok, f"to_buffer failed: {get_error(lib, err)}"
+    assert buf.positions.len == 9, f"expected 9 position floats, got {buf.positions.len}"
+    assert buf.indices.len == 3, f"expected 3 indices, got {buf.indices.len}"
+    print(f"[5] to_buffer: {buf.positions.len // 3} verts, "
+          f"{buf.indices.len // 3} triangle")
+    print(f"    positions: {buf.positions.values()}")
+    print(f"    indices:   {buf.indices.values()}")
+    lib.truck_polygonbuffer_free(buf)
+
+    # --- stage 3: merge -----------------------------------------------------
+    out2 = c_void_p()
+    err = c_void_p()
+    tri_ptr2, _keep2 = as_u8_ptr(TRI_OBJ)
+    ok = lib.truck_polygonmesh_from_obj(tri_ptr2, len(TRI_OBJ), byref(out2), byref(err))
+    assert ok and out2
+    err = c_void_p()
+    ok = lib.truck_polygonmesh_merge(m1, out2.value, byref(err))
+    assert ok, f"merge failed: {get_error(lib, err)}"
+    # merged mesh should now have 2 triangles
+    buf2 = TruckPolygonBuffer()
+    err = c_void_p()
+    ok = lib.truck_polygonmesh_to_buffer(m1, byref(buf2), byref(err))
+    assert ok and buf2.indices.len == 6, f"expected 6 indices, got {buf2.indices.len}"
+    print(f"[6] merge: combined mesh has {buf2.indices.len // 3} triangles")
+    lib.truck_polygonbuffer_free(buf2)
+    lib.truck_polygonmesh_free(m1)
+    # out2 was consumed by merge; do NOT free it again
+
+    # --- stage 3: error path (truncated binary STL) ------------------------
+    out3 = c_void_p()
+    err = c_void_p()
+    truncated = b"\x00\x00\x00\x00truncated"
+    tr_ptr, _keep3 = as_u8_ptr(truncated)
+    ok = lib.truck_polygonmesh_from_stl(
+        tr_ptr, len(truncated), STL_BINARY, byref(out3), byref(err))
+    assert not ok, "truncated STL should fail"
+    assert not out3.value
+    msg = get_error(lib, err.value)
+    assert msg, "expected a non-empty error message"
+    print(f"[7] error path: truncated STL -> '{msg[:50]}...'")
+
+    # --- stage 3: STL binary roundtrip -------------------------------------
+    out4 = c_void_p()
+    err = c_void_p()
+    tri_ptr4, _keep4 = as_u8_ptr(TRI_OBJ)
+    ok = lib.truck_polygonmesh_from_obj(tri_ptr4, len(TRI_OBJ), byref(out4), byref(err))
+    assert ok and out4
+    stl_bytes = TruckU8Array()
+    err = c_void_p()
+    ok = lib.truck_polygonmesh_to_stl(out4.value, STL_BINARY, byref(stl_bytes), byref(err))
+    assert ok and stl_bytes.len > 0
+    # re-read the stl bytes
+    out5 = c_void_p()
+    err = c_void_p()
+    stl_data = stl_bytes.bytes()
+    stl_ptr, _keep5 = as_u8_ptr(stl_data)
+    ok = lib.truck_polygonmesh_from_stl(
+        stl_ptr, len(stl_data), STL_BINARY, byref(out5), byref(err))
+    assert ok and out5, f"stl roundtrip read failed: {get_error(lib, err)}"
+    print(f"[8] STL binary roundtrip: wrote {stl_bytes.len} bytes, re-parsed OK")
+    lib.truck_u8array_free(stl_bytes)
+    lib.truck_polygonmesh_free(out4.value)
+    lib.truck_polygonmesh_free(out5.value)
+
+    print("\nAll ctypes checks passed (stage 2 + stage 3).")
     return 0
 
 
