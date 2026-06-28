@@ -646,6 +646,94 @@ pub unsafe extern "C" fn truck_solid_to_polygon(
 }
 
 // ---------------------------------------------------------------------------
+// Stage 5 — Boolean operations (and / or / not)
+// ---------------------------------------------------------------------------
+
+/// Boolean intersection: returns the solid common to `a` and `b` (A ∩ B).
+///
+/// Both solids are **borrowed**. `tol` is the geometric tolerance; a typical
+/// value is `0.05` (truck-js's default). Returns a new solid handle, or NULL
+/// if either input is NULL or the operation fails (degenerate geometry, e.g.
+/// the solids are tangent or the tolerance is unsuitable).
+///
+/// # Safety
+/// `a` and `b` must each be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_solid_and(
+    a: *const TruckSolid,
+    b: *const TruckSolid,
+    tol: f64,
+) -> *mut TruckSolid {
+    // SAFETY: caller guarantees the handles are NULL or valid.
+    let (a, b) = match (unsafe { handle::from_ref(a) }, unsafe { handle::from_ref(b) }) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return std::ptr::null_mut(),
+    };
+    let res = crate::error::truck_guard!(|| {
+        Ok::<Option<Solid>, TruckError>(truck_shapeops::and(&a.0, &b.0, tol))
+    });
+    match res {
+        Ok(Some(solid)) => handle::into_raw(TruckSolid(solid)),
+        Ok(None) => std::ptr::null_mut(),
+        Err(_panic) => std::ptr::null_mut(),
+    }
+}
+
+/// Boolean union: returns the solid combining `a` and `b` (A ∪ B).
+///
+/// See [`truck_solid_and`] for the borrowing/failure contract.
+///
+/// # Safety
+/// `a` and `b` must each be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_solid_or(
+    a: *const TruckSolid,
+    b: *const TruckSolid,
+    tol: f64,
+) -> *mut TruckSolid {
+    // SAFETY: caller guarantees the handles are NULL or valid.
+    let (a, b) = match (unsafe { handle::from_ref(a) }, unsafe { handle::from_ref(b) }) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return std::ptr::null_mut(),
+    };
+    let res = crate::error::truck_guard!(|| {
+        Ok::<Option<Solid>, TruckError>(truck_shapeops::or(&a.0, &b.0, tol))
+    });
+    match res {
+        Ok(Some(solid)) => handle::into_raw(TruckSolid(solid)),
+        Ok(None) => std::ptr::null_mut(),
+        Err(_panic) => std::ptr::null_mut(),
+    }
+}
+
+/// Flip the orientation (normals) of `solid`, returning a NEW solid.
+///
+/// The input is **borrowed** and left unchanged (the result is a clone with
+/// inverted orientation). Returns NULL if `solid` is NULL.
+///
+/// `not` is its own inverse: applying it twice yields an equivalent solid.
+///
+/// # Safety
+/// `solid` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_solid_not(solid: *const TruckSolid) -> *mut TruckSolid {
+    // SAFETY: caller guarantees solid is NULL or valid.
+    let s = match unsafe { handle::from_ref(solid) } {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let res = crate::error::truck_guard!(|| {
+        let mut clone = s.0.clone();
+        clone.not();
+        Ok::<Solid, TruckError>(clone)
+    });
+    match res {
+        Ok(solid) => handle::into_raw(TruckSolid(solid)),
+        Err(_panic) => std::ptr::null_mut(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AbstractShape — upcast / inspect / downcast
 // ---------------------------------------------------------------------------
 
@@ -1088,7 +1176,7 @@ mod tests {
     use super::*;
     // Bring helpers into scope for the 4d tessellation/error tests.
     use crate::error::truck_error_free;
-    use crate::polymesh::truck_polygonmesh_free;
+    use crate::polymesh::{truck_polygonmesh_bounding_box, truck_polygonmesh_free};
 
     #[test]
     fn new_is_non_null() {
@@ -1616,5 +1704,164 @@ mod tests {
             truck_vertex_upcast(std::ptr::null_mut());
             truck_edge_upcast(std::ptr::null_mut());
         }
+    }
+
+    // ---- stage 5: boolean operations ---------------------------------------
+
+    /// Helper: build a unit cube solid via the tsweep chain (borrowed logic).
+    fn unit_cube_solid() -> *mut TruckSolid {
+        let v = truck_vertex_new(0.0, 0.0, 0.0);
+        // SAFETY: v valid.
+        let s0 = unsafe { truck_vertex_upcast(v) };
+        let mut s1 = std::ptr::null_mut();
+        let mut s2 = std::ptr::null_mut();
+        let mut s3 = std::ptr::null_mut();
+        let mut err: *mut TruckError = std::ptr::null_mut();
+        // SAFETY: chain of valid shapes.
+        unsafe {
+            truck_tsweep(s0, [1.0, 0.0, 0.0].as_ptr(), 3, &mut s1, &mut err);
+            truck_tsweep(s1, [0.0, 1.0, 0.0].as_ptr(), 3, &mut s2, &mut err);
+            truck_tsweep(s2, [0.0, 0.0, 1.0].as_ptr(), 3, &mut s3, &mut err);
+        }
+        // SAFETY: s3 is a solid.
+        let solid = unsafe { truck_abstractshape_into_solid(s3) };
+        unsafe {
+            truck_abstractshape_free(s2);
+            truck_abstractshape_free(s1);
+            truck_abstractshape_free(s0);
+        }
+        solid
+    }
+
+    /// Stage 5 go/no-no gate: verifies that truck_modeling 0.6.0's Curve/Surface
+    /// satisfy truck_shapeops 0.4.0's ShapeOpsCurve/ShapeOpsSurface bounds AND
+    /// that the boolean pipeline actually runs, by reproducing shapeops' own
+    /// "punched cube" test (cube AND inverted cylinder). Two plain cubes fail
+    /// shapeops' intersection algorithm on aligned faces, so we use the
+    /// geometry shapeops itself validates against.
+    #[test]
+    fn shapeops_compatibility_smoke() {
+        // Reproduce shapeops' own punched-cube test. Using the full truck_modeling
+        // prelude here (rather than item imports) matches how shapeops' own
+        // tests are written, so trait methods like Point3::origin() resolve.
+        use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
+        use truck_modeling::*;
+
+        // cube
+        let v = builder::vertex(Point3::origin());
+        let e = builder::tsweep(&v, Vector3::unit_x());
+        let f = builder::tsweep(&e, Vector3::unit_y());
+        let cube = builder::tsweep(&f, Vector3::unit_z());
+
+        // cylinder (a disk swept, then inverted for subtraction)
+        let v = builder::vertex(Point3::new(0.5, 0.25, -0.5));
+        let w = builder::rsweep(&v, Point3::new(0.5, 0.5, 0.0), Vector3::unit_z(), Rad(7.0));
+        let f = builder::try_attach_plane(&[w]).unwrap();
+        let mut cylinder = builder::tsweep(&f, Vector3::unit_z() * 2.0);
+        cylinder.not();
+
+        let and = truck_shapeops::and(&cube, &cylinder, 0.05);
+        assert!(and.is_some(), "shapeops AND (punched cube) must succeed");
+        // sanity: the result tessellates
+        let poly = and.unwrap().triangulation(0.01).to_polygon();
+        assert!(!poly.positions().is_empty());
+    }
+
+    #[test]
+    fn solid_and_or_do_not_panic() {
+        // shapeops' boolean intersection is sensitive to geometry: two plain
+        // axis-aligned cubes fail on aligned faces, so we only assert here that
+        // the FFI calls run without panicking and return either a handle or
+        // NULL (both legitimate). The compatibility smoke test above proves
+        // real boolean work succeeds on suitable geometry.
+        let a = unit_cube_solid();
+        // build a second translated cube via the FFI chain
+        let va = truck_vertex_new(0.0, 0.0, 0.0);
+        // SAFETY: va valid.
+        let s0 = unsafe { truck_vertex_upcast(va) };
+        let mut s1 = std::ptr::null_mut();
+        let mut s2 = std::ptr::null_mut();
+        let mut s3 = std::ptr::null_mut();
+        let mut err: *mut TruckError = std::ptr::null_mut();
+        // SAFETY: chain valid.
+        unsafe {
+            truck_tsweep(s0, [1.0, 0.0, 0.0].as_ptr(), 3, &mut s1, &mut err);
+            truck_tsweep(s1, [0.0, 1.0, 0.0].as_ptr(), 3, &mut s2, &mut err);
+            truck_tsweep(s2, [0.0, 0.0, 1.0].as_ptr(), 3, &mut s3, &mut err);
+        }
+        let mut s3t = std::ptr::null_mut();
+        // SAFETY: s3 valid; tvec valid.
+        unsafe { truck_translated(s3, [0.5, 0.0, 0.0].as_ptr(), 3, &mut s3t, &mut err) };
+        // SAFETY: s3t is a solid.
+        let b = unsafe { truck_abstractshape_into_solid(s3t) };
+
+        // SAFETY: a, b valid. Either a handle or NULL is acceptable; we only
+        // require no panic.
+        let and_res = unsafe { truck_solid_and(a, b, 0.05) };
+        let or_res = unsafe { truck_solid_or(a, b, 0.05) };
+        // free whatever came back (NULL-safe)
+        unsafe {
+            truck_solid_free(and_res);
+            truck_solid_free(or_res);
+            truck_solid_free(b);
+            truck_solid_free(a);
+            truck_abstractshape_free(s3);
+            truck_abstractshape_free(s2);
+            truck_abstractshape_free(s1);
+            truck_abstractshape_free(s0);
+        }
+    }
+
+    #[test]
+    fn solid_not_is_involutive() {
+        // not(not(s)) should be equivalent to s (same bbox).
+        let a = unit_cube_solid();
+        // SAFETY: a valid.
+        let n1 = unsafe { truck_solid_not(a) };
+        assert!(!n1.is_null());
+        // SAFETY: n1 valid.
+        let n2 = unsafe { truck_solid_not(n1) };
+        assert!(!n2.is_null());
+        // both should tessellate to the same unit-cube bbox [0,0,0]~[1,1,1]
+        let mut m1: *mut TruckPolygonMesh = std::ptr::null_mut();
+        let mut m2: *mut TruckPolygonMesh = std::ptr::null_mut();
+        let mut err: *mut TruckError = std::ptr::null_mut();
+        // SAFETY: n2, a valid.
+        unsafe {
+            truck_solid_to_polygon(n2, 0.01, &mut m1, &mut err);
+            truck_solid_to_polygon(a, 0.01, &mut m2, &mut err);
+        }
+        let mut b1 = TruckF64Array { ptr: std::ptr::null_mut(), len: 0 };
+        let mut b2 = TruckF64Array { ptr: std::ptr::null_mut(), len: 0 };
+        // SAFETY: meshes valid.
+        unsafe {
+            truck_polygonmesh_bounding_box(m1, &mut b1);
+            truck_polygonmesh_bounding_box(m2, &mut b2);
+        }
+        // SAFETY: arrays valid for len.
+        let s1 = unsafe { std::slice::from_raw_parts(b1.ptr, b1.len) };
+        let s2 = unsafe { std::slice::from_raw_parts(b2.ptr, b2.len) };
+        assert_eq!(s1, s2, "not(not(s)) bbox should equal s bbox");
+        unsafe {
+            crate::handle::truck_f64array_free(b1);
+            crate::handle::truck_f64array_free(b2);
+            truck_polygonmesh_free(m1);
+            truck_polygonmesh_free(m2);
+            truck_solid_free(n2);
+            truck_solid_free(n1);
+            truck_solid_free(a);
+        }
+    }
+
+    #[test]
+    fn boolean_null_inputs() {
+        let a = unit_cube_solid();
+        // SAFETY: NULL second arg.
+        assert!(unsafe { truck_solid_and(a, std::ptr::null(), 0.05) }.is_null());
+        // SAFETY: NULL first arg.
+        assert!(unsafe { truck_solid_or(std::ptr::null(), a, 0.05) }.is_null());
+        // SAFETY: NULL arg.
+        assert!(unsafe { truck_solid_not(std::ptr::null()) }.is_null());
+        unsafe { truck_solid_free(a) };
     }
 }

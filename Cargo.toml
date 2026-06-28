@@ -29,6 +29,9 @@ truck-modeling = "=0.6.0"
 # truck-meshalgo provides tessellation: Solid/Shell -> PolygonMesh via the
 # RobustMeshableShape + MeshedShape traits. Used from stage 4d onward.
 truck-meshalgo = "=0.4.0"
+# truck-shapeops provides boolean operations: and / or / not on Solid.
+# Used from stage 5 onward.
+truck-shapeops = "=0.4.0"
 
 [build-dependencies]
 cbindgen = "0.27"
