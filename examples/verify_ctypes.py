@@ -106,6 +106,16 @@ class TruckPolygonBuffer(Structure):
     ]
 
 
+# Array of opaque edge handles: { ptr: *mut *mut TruckEdge, len }
+class TruckEdgeArray(Structure):
+    _fields_ = [("ptr", POINTER(c_void_p)), ("len", c_size_t)]
+
+    def handles(self):
+        if not self.ptr or self.len == 0:
+            return []
+        return [self.ptr[i] for i in range(self.len)]
+
+
 # A minimal one-triangle OBJ.
 TRI_OBJ = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1 2 3\n"
 
@@ -175,6 +185,17 @@ def setup(lib):
     lib.truck_edge_back_vertex.restype = c_void_p
     lib.truck_edge_back_vertex.argtypes = [c_void_p]
     lib.truck_edge_free.argtypes = [c_void_p]
+
+    # stage 4c — topology Face + TruckEdgeArray
+    lib.truck_face_homotopy.restype = c_void_p
+    lib.truck_face_homotopy.argtypes = [c_void_p, c_void_p]
+    lib.truck_face_boundary_edge_count.restype = c_size_t
+    lib.truck_face_boundary_edge_count.argtypes = [c_void_p]
+    lib.truck_face_boundary_edges.restype = c_bool
+    lib.truck_face_boundary_edges.argtypes = [c_void_p, POINTER(TruckEdgeArray)]
+    lib.truck_face_free.argtypes = [c_void_p]
+    lib.truck_edgearray_free.argtypes = [TruckEdgeArray]
+    lib.truck_edgearray_free_all.argtypes = [TruckEdgeArray]
 
 
 def get_error(lib, err_ptr):
@@ -366,7 +387,44 @@ def main() -> int:
     lib.truck_vertex_free(va)
     lib.truck_vertex_free(vb)
 
-    print("\nAll ctypes checks passed (stage 2 + stage 3 + stage 4a + stage 4b).")
+    # --- stage 4c: topology Face + TruckEdgeArray --------------------------
+    # Build two parallel edges, then a homotopy face between them.
+    f_v0 = lib.truck_vertex_new(0.0, 0.0, 0.0)
+    f_v1 = lib.truck_vertex_new(1.0, 0.0, 0.0)
+    f_v2 = lib.truck_vertex_new(0.0, 0.0, 1.0)
+    f_v3 = lib.truck_vertex_new(1.0, 0.0, 1.0)
+    fe0 = lib.truck_edge_line(f_v0, f_v1)
+    fe1 = lib.truck_edge_line(f_v2, f_v3)
+    assert fe0 and fe1
+    face = lib.truck_face_homotopy(fe0, fe1)
+    assert face, "face_homotopy returned NULL"
+
+    count = lib.truck_face_boundary_edge_count(face)
+    assert count == 4, f"homotopy face should have 4 boundary edges, got {count}"
+    print(f"[13] face homotopy: {count} boundary edges")
+
+    # boundary edges enumeration
+    earr = TruckEdgeArray()
+    assert lib.truck_face_boundary_edges(face, byref(earr))
+    assert earr.len == count, f"edge array len {earr.len} != count {count}"
+    hs = earr.handles()
+    assert all(h for h in hs), "all boundary edge handles must be non-null"
+    print(f"[14] face boundary_edges: {earr.len} independent handles")
+    # free_all releases container + all handles
+    lib.truck_edgearray_free_all(earr)
+
+    # NULL safety
+    assert not lib.truck_face_boundary_edges(None, byref(TruckEdgeArray()))
+    assert not lib.truck_face_homotopy(None, fe1)
+    lib.truck_face_free(face)
+    lib.truck_edge_free(fe0)
+    lib.truck_edge_free(fe1)
+    lib.truck_vertex_free(f_v0)
+    lib.truck_vertex_free(f_v1)
+    lib.truck_vertex_free(f_v2)
+    lib.truck_vertex_free(f_v3)
+
+    print("\nAll ctypes checks passed (stage 2 + 3 + 4a + 4b + 4c).")
     return 0
 
 

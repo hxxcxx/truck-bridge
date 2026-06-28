@@ -112,7 +112,7 @@ pub struct TruckStr {
 
 /// Split a `Vec<T>` into `(ptr, len, capacity)` without running its destructor,
 /// transferring ownership to the caller.
-fn vec_into_raw_parts<T>(mut v: Vec<T>) -> (*mut T, usize, usize) {
+pub(crate) fn vec_into_raw_parts<T>(mut v: Vec<T>) -> (*mut T, usize, usize) {
     // We need both the allocation pointer and the original capacity so the
     // matching `*_free` can reconstruct and drop the Vec exactly.
     let ptr = v.as_mut_ptr();
@@ -127,7 +127,7 @@ fn vec_into_raw_parts<T>(mut v: Vec<T>) -> (*mut T, usize, usize) {
 /// # Safety
 /// `ptr/len/cap` must describe a valid allocation previously produced by
 /// [`vec_into_raw_parts`], or `ptr` may be NULL with `len == cap == 0`.
-unsafe fn vec_from_raw_parts<T>(ptr: *mut T, len: usize, cap: usize) -> Vec<T> {
+pub(crate) unsafe fn vec_from_raw_parts<T>(ptr: *mut T, len: usize, cap: usize) -> Vec<T> {
     if ptr.is_null() {
         return Vec::new();
     }
