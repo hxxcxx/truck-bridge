@@ -257,6 +257,10 @@ def setup(lib):
     lib.truck_solid_not.restype = c_void_p
     lib.truck_solid_not.argtypes = [c_void_p]
 
+    # stage 6 — primitive box
+    lib.truck_solid_box.restype = c_void_p
+    lib.truck_solid_box.argtypes = [c_double, c_double, c_double]
+
 
 def get_error(lib, err_ptr):
     """If err_ptr is non-NULL, fetch + free the message, return it."""
@@ -606,7 +610,26 @@ def main() -> int:
     lib.truck_abstractshape_free(bs1.value)
     lib.truck_abstractshape_free(bs0)
 
-    print("\nAll ctypes checks passed (stage 2 + 3 + 4 + 5).")
+    # --- stage 6: primitive box --------------------------------------------
+    def box_bbox(dx, dy, dz):
+        b = lib.truck_solid_box(dx, dy, dz)
+        assert b, f"box({dx},{dy},{dz}) returned NULL"
+        m = c_void_p()
+        e = c_void_p()
+        assert lib.truck_solid_to_polygon(b, 0.01, byref(m), byref(e)), "box tessellate"
+        bb = TruckF64Array()
+        assert lib.truck_polygonmesh_bounding_box(m, byref(bb))
+        vals = bb.values()
+        lib.truck_f64array_free(bb)
+        lib.truck_polygonmesh_free(m)
+        lib.truck_solid_free(b)
+        return vals
+
+    assert box_bbox(1, 1, 1) == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], "unit box bbox"
+    assert box_bbox(2, 3, 4) == [0.0, 0.0, 0.0, 2.0, 3.0, 4.0], "2x3x4 box bbox"
+    print("[20] solid box: unit and 2x3x4 bbox correct")
+
+    print("\nAll ctypes checks passed (stage 2 + 3 + 4 + 5 + 6).")
     return 0
 
 

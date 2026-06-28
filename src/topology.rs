@@ -733,6 +733,31 @@ pub unsafe extern "C" fn truck_solid_not(solid: *const TruckSolid) -> *mut Truck
     }
 }
 
+/// Create an axis-aligned box (rectangular cuboid) with one corner at the
+/// origin and dimensions `(dx, dy, dz)` along the +x/+y/+z axes.
+///
+/// This is a convenience primitive equivalent to three `tsweep` operations
+/// (vertex -> edge -> face -> solid), offered as a single call since it is the
+/// most common modeling entry point.
+///
+/// `dx`/`dy`/`dz` may be any finite values (negative values sweep in the
+/// negative axis direction); passing all-zero yields NULL. Returns a new solid
+/// handle, or NULL on internal failure (the guard converts any panic to NULL).
+#[no_mangle]
+pub extern "C" fn truck_solid_box(dx: f64, dy: f64, dz: f64) -> *mut TruckSolid {
+    let res = crate::error::truck_guard!(|| -> Result<Solid, TruckError> {
+        let v = builder::vertex(Point3::new(0.0, 0.0, 0.0));
+        let e = builder::tsweep(&v, Vector3::new(dx, 0.0, 0.0));
+        let f = builder::tsweep(&e, Vector3::new(0.0, dy, 0.0));
+        let s = builder::tsweep(&f, Vector3::new(0.0, 0.0, dz));
+        Ok(s)
+    });
+    match res {
+        Ok(solid) => handle::into_raw(TruckSolid(solid)),
+        Err(_panic) => std::ptr::null_mut(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AbstractShape — upcast / inspect / downcast
 // ---------------------------------------------------------------------------
@@ -1863,5 +1888,43 @@ mod tests {
         // SAFETY: NULL arg.
         assert!(unsafe { truck_solid_not(std::ptr::null()) }.is_null());
         unsafe { truck_solid_free(a) };
+    }
+
+    // ---- stage 6: primitive box -------------------------------------------
+
+    /// Tessellate a solid and return its [min_xyz, max_xyz] bbox as a Vec<f64>.
+    unsafe fn solid_bbox(solid: *const TruckSolid) -> Vec<f64> {
+        let mut mesh: *mut TruckPolygonMesh = std::ptr::null_mut();
+        let mut err: *mut TruckError = std::ptr::null_mut();
+        // SAFETY: solid valid.
+        unsafe { truck_solid_to_polygon(solid, 0.01, &mut mesh, &mut err) };
+        let mut bbox = TruckF64Array { ptr: std::ptr::null_mut(), len: 0 };
+        // SAFETY: mesh valid.
+        unsafe { truck_polygonmesh_bounding_box(mesh, &mut bbox) };
+        // SAFETY: bbox valid for len.
+        let v = unsafe { std::slice::from_raw_parts(bbox.ptr, bbox.len) }.to_vec();
+        unsafe {
+            crate::handle::truck_f64array_free(bbox);
+            truck_polygonmesh_free(mesh);
+        }
+        v
+    }
+
+    #[test]
+    fn solid_box_unit() {
+        let b = truck_solid_box(1.0, 1.0, 1.0);
+        assert!(!b.is_null(), "unit box must be non-null");
+        let bb = unsafe { solid_bbox(b) };
+        assert_eq!(bb, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], "unit box bbox");
+        unsafe { truck_solid_free(b) };
+    }
+
+    #[test]
+    fn solid_box_nonuniform() {
+        let b = truck_solid_box(2.0, 3.0, 4.0);
+        assert!(!b.is_null());
+        let bb = unsafe { solid_bbox(b) };
+        assert_eq!(bb, vec![0.0, 0.0, 0.0, 2.0, 3.0, 4.0], "2x3x4 box bbox");
+        unsafe { truck_solid_free(b) };
     }
 }
