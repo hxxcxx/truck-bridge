@@ -80,6 +80,41 @@ macro_rules! truck_guard {
 }
 pub(crate) use truck_guard;
 
+/// Drive a [`truck_guard!`] result into the FFI `(bool, *err)` contract:
+///   - `Ok(v)`  → run `$ok(v)` (which writes the success out-parameter).
+///   - `Err(e)` → write the error handle to `*$err` (if non-NULL), otherwise
+///     drop it to avoid a leak; return `false`.
+///
+/// `$res` is a `Result<T, *mut TruckError>` as produced by `truck_guard!`.
+///
+/// This is the second half of the error pipeline (guard produces, deliver
+/// consumes) and is shared by every module that exposes `err` out-parameters.
+/// Exported at crate root so all modules can call `crate::truck_deliver!(...)`;
+/// `#[doc(hidden)]` keeps it out of the public surface.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! truck_deliver {
+    ($res:expr, $err:expr, $ok:expr) => {
+        match $res {
+            ::std::result::Result::Ok(v) => {
+                $ok(v);
+                true
+            }
+            ::std::result::Result::Err(e) => {
+                if !$err.is_null() {
+                    // SAFETY: caller guarantees err points to writable storage.
+                    unsafe { *$err = e };
+                } else {
+                    // Nobody to receive it; reclaim to avoid a leak.
+                    // SAFETY: e is a freshly-allocated owning handle.
+                    unsafe { $crate::handle::take_raw::<$crate::error::TruckError>(e) };
+                }
+                false
+            }
+        }
+    };
+}
+
 /// Turn a panic payload (`Box<dyn Any + Send>`) into a best-effort string.
 ///
 /// Written as a plain function taking a trait object so cbindgen can parse it.

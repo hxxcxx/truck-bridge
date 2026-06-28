@@ -22,6 +22,10 @@ crate-type = ["cdylib", "staticlib"]
 # change internal layout of types held behind opaque handles. Upgrading truck
 # is an explicit, deliberate action.
 truck-polymesh = "=0.6.0"
+# truck-modeling brings the concrete topology layer (Vertex/Edge/.../Solid,
+# already monomorphized to <Point3, Curve, Surface> by its `prelude!` macro),
+# plus the builder API. Used from stage 4 onward.
+truck-modeling = "=0.6.0"
 
 [build-dependencies]
 cbindgen = "0.27"

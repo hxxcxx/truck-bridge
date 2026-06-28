@@ -150,6 +150,13 @@ def setup(lib):
     lib.truck_polygonbuffer_free.argtypes = [TruckPolygonBuffer]
     lib.truck_str_free.argtypes = [TruckStr]
 
+    # stage 4a — topology Vertex
+    lib.truck_vertex_new.restype = c_void_p
+    lib.truck_vertex_new.argtypes = [c_double, c_double, c_double]
+    lib.truck_vertex_point.restype = c_bool
+    lib.truck_vertex_point.argtypes = [c_void_p, POINTER(TruckF64Array)]
+    lib.truck_vertex_free.argtypes = [c_void_p]
+
 
 def get_error(lib, err_ptr):
     """If err_ptr is non-NULL, fetch + free the message, return it."""
@@ -277,7 +284,21 @@ def main() -> int:
     lib.truck_polygonmesh_free(out4.value)
     lib.truck_polygonmesh_free(out5.value)
 
-    print("\nAll ctypes checks passed (stage 2 + stage 3).")
+    # --- stage 4a: topology Vertex -----------------------------------------
+    v = lib.truck_vertex_new(1.0, 2.0, 3.0)
+    assert v, "vertex_new returned NULL"
+    varr = TruckF64Array()
+    assert lib.truck_vertex_point(v, byref(varr))
+    pts = varr.values()
+    assert pts == [1.0, 2.0, 3.0], f"vertex point mismatch: {pts}"
+    print(f"[9] vertex new/point: {pts}")
+    lib.truck_f64array_free(varr)
+    lib.truck_vertex_free(v)
+    # NULL safety
+    assert not lib.truck_vertex_point(None, byref(TruckF64Array()))
+    lib.truck_vertex_free(None)  # idempotent
+
+    print("\nAll ctypes checks passed (stage 2 + stage 3 + stage 4a).")
     return 0
 
 

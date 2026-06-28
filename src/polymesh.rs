@@ -91,30 +91,8 @@ pub struct TruckPolygonBuffer {
 // result-delivery helper
 // ---------------------------------------------------------------------------
 
-/// Drive a [`truck_guard!`] result into `(bool, *err)`:
-///   - `Ok(v)`  → run `$ok(v)` (which writes into the success out-parameter).
-///   - `Err(e)` → write the error handle to `*err` (if non-NULL), ignore v.
-///
-/// `$res` is a `Result<T, *mut TruckError>` as produced by `truck_guard!`.
-macro_rules! truck_deliver {
-    ($res:expr, $err:expr, $ok:expr) => {
-        match $res {
-            ::std::result::Result::Ok(v) => { $ok(v); true }
-            ::std::result::Result::Err(e) => {
-                if !$err.is_null() {
-                    // SAFETY: caller guarantees err points to writable storage.
-                    unsafe { *$err = e };
-                } else {
-                    // Nobody to receive it; free to avoid a leak.
-                    // SAFETY: e is a freshly-allocated owning handle.
-                    unsafe { crate::handle::take_raw::<TruckError>(e) };
-                }
-                false
-            }
-        }
-    };
-}
-// (macro_rules! truck_deliver is in scope within this module without an import)
+// `truck_deliver!` is defined in `error.rs` and exported at the crate root
+// (`crate::truck_deliver!`) so every module shares one error-delivery path.
 
 /// Wrap a fallible truck operation in an error-converting closure for
 /// `truck_guard!`. Maps `Result<_, E: Display>` to `Result<_, TruckError>`.
@@ -218,7 +196,7 @@ pub unsafe extern "C" fn truck_polygonmesh_from_obj(
         unsafe { std::slice::from_raw_parts(data, len) }
     };
     let res = error::truck_guard!(|| lift(truck_polymesh::obj::read::<&[u8]>(bytes)));
-    truck_deliver!(res, err, |m: crate::PolygonMesh| {
+    crate::truck_deliver!(res, err, |m: crate::PolygonMesh| {
         // SAFETY: out_mesh checked non-NULL above.
         unsafe { *out_mesh = handle::into_raw(TruckPolygonMesh(m)) };
     })
@@ -249,7 +227,7 @@ pub unsafe extern "C" fn truck_polygonmesh_from_stl(
     let res = error::truck_guard!(|| {
         lift(truck_polymesh::stl::read::<&[u8]>(bytes, stl_type.into()))
     });
-    truck_deliver!(res, err, |m: crate::PolygonMesh| {
+    crate::truck_deliver!(res, err, |m: crate::PolygonMesh| {
         // SAFETY: out_mesh checked non-NULL above.
         unsafe { *out_mesh = handle::into_raw(TruckPolygonMesh(m)) };
     })
@@ -282,7 +260,7 @@ pub unsafe extern "C" fn truck_polygonmesh_to_obj(
         lift(truck_polymesh::obj::write(&m.0, &mut buf))?;
         Ok::<_, TruckError>(buf)
     });
-    truck_deliver!(res, err, |buf: Vec<u8>| {
+    crate::truck_deliver!(res, err, |buf: Vec<u8>| {
         // SAFETY: out checked non-NULL above.
         unsafe { *out = TruckU8Array::from(buf) };
     })
@@ -313,7 +291,7 @@ pub unsafe extern "C" fn truck_polygonmesh_to_stl(
         lift(truck_polymesh::stl::write(&m.0, &mut buf, stl_type.into()))?;
         Ok::<_, TruckError>(buf)
     });
-    truck_deliver!(res, err, |buf: Vec<u8>| {
+    crate::truck_deliver!(res, err, |buf: Vec<u8>| {
         // SAFETY: out checked non-NULL above.
         unsafe { *out = TruckU8Array::from(buf) };
     })
@@ -384,7 +362,7 @@ pub unsafe extern "C" fn truck_polygonmesh_to_buffer(
             indices: TruckU32Array::from(indices),
         })
     });
-    truck_deliver!(res, err, |buf: TruckPolygonBuffer| {
+    crate::truck_deliver!(res, err, |buf: TruckPolygonBuffer| {
         // SAFETY: out checked non-NULL above.
         unsafe { *out = buf };
     })
@@ -423,7 +401,7 @@ pub unsafe extern "C" fn truck_polygonmesh_merge(
         dst_ref.0.merge(src_mesh);
         Ok::<_, TruckError>(())
     });
-    truck_deliver!(res, err, |_v: ()| {})
+    crate::truck_deliver!(res, err, |_v: ()| {})
 }
 
 /// Free a [`TruckPolygonBuffer`] and its four internal arrays. Idempotent: each

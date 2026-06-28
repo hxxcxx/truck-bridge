@@ -39,6 +39,7 @@
 pub mod error;
 pub mod handle;
 pub mod polymesh;
+pub mod topology;
 pub mod version;
 
 // Re-export the concrete truck type used by polymesh so the whole crate agrees
