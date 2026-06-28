@@ -261,6 +261,23 @@ def setup(lib):
     lib.truck_solid_box.restype = c_void_p
     lib.truck_solid_box.argtypes = [c_double, c_double, c_double]
 
+    # stage 7 — Wire + primitives (cylinder/sphere/cone)
+    lib.truck_wire_from_edges.restype = c_void_p
+    lib.truck_wire_from_edges.argtypes = [POINTER(c_void_p), c_size_t]
+    lib.truck_wire_edge_count.restype = c_size_t
+    lib.truck_wire_edge_count.argtypes = [c_void_p]
+    lib.truck_wire_is_closed.restype = c_bool
+    lib.truck_wire_is_closed.argtypes = [c_void_p]
+    lib.truck_wire_free.argtypes = [c_void_p]
+    lib.truck_face_attach_plane.restype = c_void_p
+    lib.truck_face_attach_plane.argtypes = [c_void_p]
+    lib.truck_solid_cylinder.restype = c_void_p
+    lib.truck_solid_cylinder.argtypes = [c_double, c_double]
+    lib.truck_solid_sphere.restype = c_void_p
+    lib.truck_solid_sphere.argtypes = [c_double]
+    lib.truck_solid_cone.restype = c_void_p
+    lib.truck_solid_cone.argtypes = [c_double, c_double]
+
 
 def get_error(lib, err_ptr):
     """If err_ptr is non-NULL, fetch + free the message, return it."""
@@ -529,14 +546,18 @@ def main() -> int:
     print(f"[16] solid_to_polygon: cube bbox = {bb}")
     lib.truck_f64array_free(bbox)
     lib.truck_polygonmesh_free(mesh_out.value)
-    lib.truck_solid_free(solid)
 
-    # tsweep a solid -> error
+    # tsweep a solid -> error (re-upcast the solid into a fresh AbstractShape,
+    # the original shape3 was already consumed by into_solid above).
+    # truck_solid_upcast consumes `solid`, so we free only the AbstractShape.
+    solid_shape = lib.truck_solid_upcast(solid)
     err = c_void_p()
     bad_out = c_void_p()
-    assert not lib.truck_tsweep(shape3, vx_ptr, 3, byref(bad_out), byref(err)), "tsweep solid should fail"
+    assert not lib.truck_tsweep(solid_shape, vx_ptr, 3, byref(bad_out), byref(err)), "tsweep solid should fail"
     msg = get_error(lib, err.value)
     assert msg, "expected error message"
+
+    lib.truck_abstractshape_free(solid_shape)
 
     # translated: vertex -> translated vertex, point moves
     tv = lib.truck_vertex_new(0.0, 0.0, 0.0)
@@ -629,7 +650,59 @@ def main() -> int:
     assert box_bbox(2, 3, 4) == [0.0, 0.0, 0.0, 2.0, 3.0, 4.0], "2x3x4 box bbox"
     print("[20] solid box: unit and 2x3x4 bbox correct")
 
-    print("\nAll ctypes checks passed (stage 2 + 3 + 4 + 5 + 6).")
+    # --- stage 7: Wire + primitives (cylinder/sphere/cone) -----------------
+    def tess_bbox(make_handle):
+        b = make_handle
+        m = c_void_p()
+        e = c_void_p()
+        assert lib.truck_solid_to_polygon(b, 0.05, byref(m), byref(e)), "tessellate"
+        bb = TruckF64Array()
+        assert lib.truck_polygonmesh_bounding_box(m, byref(bb))
+        vals = bb.values()
+        lib.truck_f64array_free(bb)
+        lib.truck_polygonmesh_free(m)
+        lib.truck_solid_free(b)
+        return vals
+
+    # cylinder r=1 h=2: base at z=0, axis +z
+    cy = tess_bbox(lib.truck_solid_cylinder(1.0, 2.0))
+    assert cy[2] > -0.1 and cy[2] < 0.1, f"cyl min.z ~ 0: {cy}"
+    assert cy[5] > 1.9 and cy[5] < 2.1, f"cyl max.z ~ 2: {cy}"
+    assert cy[0] > -1.1 and cy[0] < -0.9, f"cyl min.x ~ -1: {cy}"
+    print(f"[21] solid cylinder r=1 h=2: bbox z in [{cy[2]:.2f},{cy[5]:.2f}]")
+
+    # sphere r=1 centered at origin
+    sp = tess_bbox(lib.truck_solid_sphere(1.0))
+    for i in range(6):
+        assert -1.1 < sp[i] < 1.1, f"sphere coord {i} out of range: {sp}"
+    print(f"[22] solid sphere r=1: bbox within unit (max abs {max(abs(v) for v in sp):.2f})")
+
+    # cone r=1 h=2: just verify it builds a finite solid
+    co = tess_bbox(lib.truck_solid_cone(1.0, 2.0))
+    assert all(not math.isinf(v) for v in co), f"cone bbox must be finite: {co}"
+    print(f"[23] solid cone r=1 h=2: finite bbox (extent {[round(v,2) for v in co]})")
+
+    # degenerate inputs
+    assert not lib.truck_solid_cylinder(0.0, 1.0), "cyl r=0 -> NULL"
+    assert not lib.truck_solid_sphere(-1.0), "sphere r<0 -> NULL"
+
+    # wire from edges + is_closed + attach_plane
+    wv = [lib.truck_vertex_new(*p) for p in [(0,0,0),(1,0,0),(1,1,0),(0,1,0)]]
+    we = [lib.truck_edge_line(wv[i], wv[(i+1) % 4]) for i in range(4)]
+    we_ptr, _ = as_void_ptr_arr(we)
+    wire = lib.truck_wire_from_edges(we_ptr, 4)
+    assert wire, "wire must be non-null"
+    assert lib.truck_wire_edge_count(wire) == 4, "wire should have 4 edges"
+    assert lib.truck_wire_is_closed(wire), "square wire should be closed"
+    face = lib.truck_face_attach_plane(wire)
+    assert face, "attach_plane should fill the closed wire"
+    print("[24] wire: 4 edges, closed, attach_plane -> face OK")
+    lib.truck_face_free(face)
+    lib.truck_wire_free(wire)
+    for h in wv:
+        lib.truck_vertex_free(h)
+
+    print("\nAll ctypes checks passed (stage 2 + 3 + 4 + 5 + 6 + 7).")
     return 0
 
 

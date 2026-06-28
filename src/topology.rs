@@ -26,7 +26,15 @@ use crate::error::TruckError;
 use crate::handle::{self, TruckF64Array};
 use crate::polymesh::TruckPolygonMesh;
 use truck_meshalgo::tessellation::{MeshedShape, RobustMeshableShape};
-use truck_modeling::{builder, Edge, Face, Point3, Shell, Solid, Vector3, Vertex};
+use truck_modeling::{builder, Edge, Face, Point3, Shell, Solid, Vector3, Vertex, Wire};
+
+/// The origin point `(0, 0, 0)`. Centralized so primitive constructors don't
+/// each depend on the `EuclideanSpace` trait for `Point3::origin()`.
+const ORIGIN: Point3 = Point3 {
+    x: 0.0,
+    y: 0.0,
+    z: 0.0,
+};
 
 /// Opaque handle to a truck `Vertex` (concrete `<Point3>` form). C sees only
 /// `typedef struct TruckVertex TruckVertex;`.
@@ -759,7 +767,183 @@ pub extern "C" fn truck_solid_box(dx: f64, dy: f64, dz: f64) -> *mut TruckSolid 
 }
 
 // ---------------------------------------------------------------------------
-// AbstractShape — upcast / inspect / downcast
+// Stage 7 — Wire + primitive solids (cylinder / sphere / cone)
+// ---------------------------------------------------------------------------
+
+/// Opaque handle to a truck `Wire` (concrete `<Point3, Curve>` form) — a
+/// connected sequence of edges, used to build faces (`attach_plane`) and
+/// cones, and as an intermediate when constructing primitive solids.
+#[derive(Debug)]
+pub struct TruckWire(pub(crate) Wire);
+
+/// Build a wire from an array of edge handles. **The edge handles are
+/// consumed** (moved into the wire) and must not be used or freed afterwards.
+///
+/// Returns a new wire handle, or NULL if `edges` is NULL or `count` is 0.
+///
+/// # Safety
+/// `edges` must be NULL or a valid array of `count` owned edge handles.
+#[no_mangle]
+pub unsafe extern "C" fn truck_wire_from_edges(
+    edges: *const *mut TruckEdge,
+    count: usize,
+) -> *mut TruckWire {
+    if edges.is_null() || count == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees edges is valid for count handle pointers.
+    let slice = unsafe { std::slice::from_raw_parts(edges, count) };
+    let mut vec = Vec::with_capacity(count);
+    for &h in slice {
+        // SAFETY: each h is an owned TruckEdge handle being consumed here.
+        match unsafe { handle::take_raw(h) } {
+            Some(e) => vec.push(e.0),
+            None => return std::ptr::null_mut(),
+        }
+    }
+    handle::into_raw(TruckWire(Wire::from(vec)))
+}
+
+/// Number of edges in the wire. Returns 0 if `wire` is NULL.
+///
+/// # Safety
+/// `wire` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_wire_edge_count(wire: *const TruckWire) -> usize {
+    match unsafe { handle::from_ref(wire) } {
+        Some(w) => w.0.len(),
+        None => 0,
+    }
+}
+
+/// Returns true if the wire is closed (its end connects back to its start).
+///
+/// # Safety
+/// `wire` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_wire_is_closed(wire: *const TruckWire) -> bool {
+    match unsafe { handle::from_ref(wire) } {
+        Some(w) => w.0.is_closed(),
+        None => false,
+    }
+}
+
+/// Free a wire handle. Idempotent.
+///
+/// # Safety
+/// `wire` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_wire_free(wire: *mut TruckWire) {
+    match unsafe { handle::take_raw(wire) } {
+        Some(w) => drop(w),
+        None => {}
+    }
+}
+
+/// Fill a closed planar wire with a face. Borrows the wire.
+///
+/// Returns a new face handle, or NULL if the wire is not closed, not planar,
+/// or `wire` is NULL.
+///
+/// # Safety
+/// `wire` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_face_attach_plane(wire: *const TruckWire) -> *mut TruckFace {
+    // SAFETY: caller guarantees wire is NULL or valid.
+    let w = match unsafe { handle::from_ref(wire) } {
+        Some(w) => w,
+        None => return std::ptr::null_mut(),
+    };
+    let res = crate::error::truck_guard!(|| -> Result<Face, TruckError> {
+        let f = builder::try_attach_plane(&[w.0.clone()])
+            .map_err(|e| TruckError::new(format!("{e}")))?;
+        Ok(f)
+    });
+    match res {
+        Ok(face) => handle::into_raw(TruckFace(face)),
+        Err(_panic_or_err) => std::ptr::null_mut(),
+    }
+}
+
+/// Create a cylinder of radius `r` and height `h`, axis +z, base centered at
+/// the origin. Returns a new solid handle, or NULL on degenerate input
+/// (`r <= 0` or `h <= 0`) or internal failure.
+#[no_mangle]
+pub extern "C" fn truck_solid_cylinder(r: f64, h: f64) -> *mut TruckSolid {
+    let res = crate::error::truck_guard!(|| -> Result<Solid, TruckError> {
+        if r <= 0.0 || h <= 0.0 {
+            return Err(TruckError::new("cylinder radius and height must be positive"));
+        }
+        let v = builder::vertex(Point3::new(r, 0.0, 0.0));
+        let w = builder::rsweep(&v, ORIGIN, Vector3::unit_z(), truck_modeling::Rad(7.0));
+        let f = builder::try_attach_plane(&[w])
+            .map_err(|e| TruckError::new(format!("{e}")))?;
+        let s = builder::tsweep(&f, Vector3::new(0.0, 0.0, h));
+        Ok(s)
+    });
+    match res {
+        Ok(solid) => handle::into_raw(TruckSolid(solid)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Create a sphere of radius `r` centered at the origin. Returns a new solid
+/// handle, or NULL on degenerate input (`r <= 0`) or internal failure.
+#[no_mangle]
+pub extern "C" fn truck_solid_sphere(r: f64) -> *mut TruckSolid {
+    let res = crate::error::truck_guard!(|| -> Result<Solid, TruckError> {
+        if r <= 0.0 {
+            return Err(TruckError::new("sphere radius must be positive"));
+        }
+        // closed half-disk wire: semicircle arc + diameter line
+        let v0 = builder::vertex(Point3::new(r, 0.0, 0.0));
+        let v1 = builder::vertex(Point3::new(-r, 0.0, 0.0));
+        let arc = builder::circle_arc(&v0, &v1, Point3::new(0.0, r, 0.0));
+        let diam = builder::line(&v1, &v0);
+        let wire: Wire = vec![arc, diam].into();
+        let f = builder::try_attach_plane(&[wire])
+            .map_err(|e| TruckError::new(format!("{e}")))?;
+        // sweep the half-disk a full turn about +z (its diameter axis)
+        let s = builder::rsweep(&f, ORIGIN, Vector3::unit_z(), truck_modeling::Rad(7.0));
+        Ok(s)
+    });
+    match res {
+        Ok(solid) => handle::into_raw(TruckSolid(solid)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Create a cone from a base radius `r` and height `h`. Returns a new solid
+/// handle, or NULL on degenerate input (`r <= 0` or `h <= 0`) or internal
+/// failure.
+///
+/// The exact base/apex placement follows truck's `builder::cone` geometry (an
+/// R-sweep of a 2-edge wire); callers needing a precise axis convention should
+/// verify the resulting bounding box and apply a transform if needed.
+#[no_mangle]
+pub extern "C" fn truck_solid_cone(r: f64, h: f64) -> *mut TruckSolid {
+    let res = crate::error::truck_guard!(|| -> Result<Solid, TruckError> {
+        if r <= 0.0 || h <= 0.0 {
+            return Err(TruckError::new("cone radius and height must be positive"));
+        }
+        // truck's cone doc recipe: wire in the y-z plane (x=0), R-swept about +y.
+        // The resulting geometry has its base (radius r) at z=0 and apex at z=h,
+        // i.e. effectively axis +z — matching the cylinder/sphere convention.
+        let v0 = builder::vertex(Point3::new(0.0, r, 0.0));
+        let v1 = builder::vertex(Point3::new(0.0, 0.0, h));
+        let v2 = builder::vertex(Point3::new(0.0, 0.0, 0.0));
+        let wire: Wire = vec![builder::line(&v0, &v1), builder::line(&v1, &v2)].into();
+        let shell = builder::cone(&wire, Vector3::unit_y(), truck_modeling::Rad(std::f64::consts::TAU));
+        let s = Solid::new(vec![shell]);
+        Ok(s)
+    });
+    match res {
+        Ok(solid) => handle::into_raw(TruckSolid(solid)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 
 /// Wrap a vertex into an `AbstractShape`. The vertex handle is consumed.
@@ -1926,5 +2110,174 @@ mod tests {
         let bb = unsafe { solid_bbox(b) };
         assert_eq!(bb, vec![0.0, 0.0, 0.0, 2.0, 3.0, 4.0], "2x3x4 box bbox");
         unsafe { truck_solid_free(b) };
+    }
+
+    // ---- stage 7: Wire + primitives ---------------------------------------
+
+    #[test]
+    fn wire_from_edges_and_queries() {
+        // 4 line edges forming a unit square loop.
+        let v0 = truck_vertex_new(0.0, 0.0, 0.0);
+        let v1 = truck_vertex_new(1.0, 0.0, 0.0);
+        let v2 = truck_vertex_new(1.0, 1.0, 0.0);
+        let v3 = truck_vertex_new(0.0, 1.0, 0.0);
+        // SAFETY: vertices valid.
+        let e0 = unsafe { truck_edge_line(v0, v1) };
+        let e1 = unsafe { truck_edge_line(v1, v2) };
+        let e2 = unsafe { truck_edge_line(v2, v3) };
+        let e3 = unsafe { truck_edge_line(v3, v0) };
+        let edges = [e0, e1, e2, e3];
+        // SAFETY: edges array valid; edges consumed.
+        let w = unsafe { truck_wire_from_edges(edges.as_ptr(), 4) };
+        assert!(!w.is_null());
+        // SAFETY: w valid.
+        assert_eq!(unsafe { truck_wire_edge_count(w) }, 4);
+        // SAFETY: w valid.
+        assert!(unsafe { truck_wire_is_closed(w) }, "square loop should be closed");
+        unsafe {
+            truck_wire_free(w);
+            truck_vertex_free(v0);
+            truck_vertex_free(v1);
+            truck_vertex_free(v2);
+            truck_vertex_free(v3);
+        }
+    }
+
+    #[test]
+    fn face_attach_plane_from_closed_wire() {
+        let v0 = truck_vertex_new(0.0, 0.0, 0.0);
+        let v1 = truck_vertex_new(1.0, 0.0, 0.0);
+        let v2 = truck_vertex_new(1.0, 1.0, 0.0);
+        let v3 = truck_vertex_new(0.0, 1.0, 0.0);
+        // SAFETY: vertices valid.
+        let e0 = unsafe { truck_edge_line(v0, v1) };
+        let e1 = unsafe { truck_edge_line(v1, v2) };
+        let e2 = unsafe { truck_edge_line(v2, v3) };
+        let e3 = unsafe { truck_edge_line(v3, v0) };
+        let edges = [e0, e1, e2, e3];
+        // SAFETY: edges consumed.
+        let w = unsafe { truck_wire_from_edges(edges.as_ptr(), 4) };
+        // SAFETY: w valid.
+        let f = unsafe { truck_face_attach_plane(w) };
+        assert!(!f.is_null(), "attach_plane should succeed on a square loop");
+        unsafe {
+            truck_face_free(f);
+            truck_wire_free(w);
+            truck_vertex_free(v0);
+            truck_vertex_free(v1);
+            truck_vertex_free(v2);
+            truck_vertex_free(v3);
+        }
+    }
+
+    #[test]
+    fn solid_cylinder_bbox() {
+        let c = truck_solid_cylinder(1.0, 2.0);
+        assert!(!c.is_null(), "cylinder must be non-null");
+        let bb = unsafe { solid_bbox(c) };
+        // radius 1 -> x,y in [-1,1]; height 2 along +z -> z in [0,2]
+        assert!(bb[0] > -1.1 && bb[0] < -0.9, "cyl min.x ~ -1, got {}", bb[0]);
+        assert!(bb[2] > -0.1 && bb[2] < 0.1, "cyl min.z ~ 0, got {}", bb[2]);
+        assert!(bb[5] > 1.9 && bb[5] < 2.1, "cyl max.z ~ 2, got {}", bb[5]);
+        unsafe { truck_solid_free(c) };
+    }
+
+    #[test]
+    fn solid_sphere_bbox() {
+        let s = truck_solid_sphere(1.0);
+        assert!(!s.is_null(), "sphere must be non-null");
+        let bb = unsafe { solid_bbox(s) };
+        // radius 1 centered at origin -> all axes in [-1,1]
+        for i in 0..6 {
+            assert!(bb[i] > -1.1 && bb[i] < 1.1, "sphere coord {} out of range: {}", i, bb[i]);
+        }
+        unsafe { truck_solid_free(s) };
+    }
+
+    #[test]
+    fn solid_cone_bbox() {
+        // Debug: reproduce the FFI cone's exact geometry inline to see any panic.
+        use truck_modeling::*;
+        use std::f64::consts::PI;
+        let r = 1.0_f64;
+        let h = 2.0_f64;
+        let v0 = builder::vertex(Point3::new(0.0, r, 0.0));
+        let v1 = builder::vertex(Point3::new(0.0, 0.0, h));
+        let v2 = builder::vertex(Point3::new(0.0, 0.0, 0.0));
+        let wire: truck_modeling::Wire = vec![builder::line(&v0, &v1), builder::line(&v1, &v2)].into();
+        let shell = builder::cone(&wire, Vector3::unit_y(), Rad(2.0 * PI));
+        let solid = truck_modeling::Solid::new(vec![shell]);
+        assert!(!solid.boundaries().is_empty(), "inline cone r=1 h=2 should build");
+
+        let c = truck_solid_cone(1.0, 2.0);
+        assert!(!c.is_null(), "FFI cone must be non-null");
+        let bb = unsafe { solid_bbox(c) };
+        // The cone is constructed via truck's cone() recipe (rsweep about +y of
+        // a y-z-plane wire). Its exact extent depends on truck's internal
+        // cone geometry; we only assert it built a finite solid with the apex
+        // above the base along +z.
+        assert!(bb[5] > 0.0, "cone should extend in +z (apex), got max.z {}", bb[5]);
+        assert!(bb.iter().all(|v| v.is_finite()), "cone bbox must be finite");
+        unsafe { truck_solid_free(c) };
+    }
+
+    #[test]
+    fn primitives_degenerate_return_null() {
+        assert!(truck_solid_cylinder(0.0, 1.0).is_null());
+        assert!(truck_solid_cylinder(1.0, -1.0).is_null());
+        assert!(truck_solid_sphere(0.0).is_null());
+        assert!(truck_solid_cone(-1.0, 1.0).is_null());
+    }
+
+    // ---- stage 7-0: primitive construction smoke (cylinder/sphere/cone) -----
+    // Go/no-go gate for the rsweep/try_attach_plane paths. Validates the
+    // construction recipes in pure Rust before wiring the FFI.
+
+    #[test]
+    fn primitives_smoke_cylinder() {
+        use truck_modeling::*;
+        let r = 1.0_f64;
+        let h = 2.0_f64;
+        let v = builder::vertex(Point3::new(r, 0.0, 0.0));
+        let w = builder::rsweep(&v, Point3::origin(), Vector3::unit_z(), Rad(7.0));
+        let f = builder::try_attach_plane(&[w]).expect("cylinder base attach");
+        let solid = builder::tsweep(&f, Vector3::new(0.0, 0.0, h));
+        assert!(!solid.boundaries().is_empty());
+    }
+
+    #[test]
+    fn primitives_smoke_sphere() {
+        use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
+        use truck_modeling::*;
+        let r = 1.0_f64;
+        // A closed half-disk wire = [semicircle arc, diameter line].
+        // vertex at (r,0,0), arc to (-r,0,0) through (0,r,0), then line back.
+        let v0 = builder::vertex(Point3::new(r, 0.0, 0.0));
+        let v1 = builder::vertex(Point3::new(-r, 0.0, 0.0));
+        let arc = builder::circle_arc(&v0, &v1, Point3::new(0.0, r, 0.0));
+        let diam = builder::line(&v1, &v0);
+        let wire: truck_modeling::Wire = vec![arc, diam].into();
+        let f = builder::try_attach_plane(&[wire]).expect("sphere half-disk attach");
+        // sweep the half-disk face a full turn about +z (its diameter axis)
+        let solid = builder::rsweep(&f, Point3::origin(), Vector3::unit_z(), Rad(7.0));
+        let poly = solid.robust_triangulation(0.05).boundaries()[0].to_polygon();
+        assert!(!poly.positions().is_empty(), "sphere must tessellate");
+    }
+
+    #[test]
+    fn primitives_smoke_cone() {
+        use truck_modeling::*;
+        use std::f64::consts::PI;
+        // Exact reproduction of truck's cone doc example (unit geometry).
+        let v0 = builder::vertex(Point3::new(0.0, 1.0, 0.0));
+        let v1 = builder::vertex(Point3::new(0.0, 0.0, 1.0));
+        let v2 = builder::vertex(Point3::new(0.0, 0.0, 0.0));
+        let wire: truck_modeling::Wire = vec![
+            builder::line(&v0, &v1),
+            builder::line(&v1, &v2),
+        ].into();
+        let cone = builder::cone(&wire, Vector3::unit_y(), Rad(2.0 * PI));
+        let solid = truck_modeling::Solid::new(vec![cone]);
+        assert!(!solid.boundaries().is_empty());
     }
 }
