@@ -1,10 +1,9 @@
 //! Topology layer C ABI surface — the B-rep types (`Vertex`, `Edge`, `Wire`,
 //! `Face`, `Shell`, `Solid`).
 //!
-//! Stage 4a (current): `Vertex` only — construct, read back its point, free.
-//! This is the **stress test** that truck-modeling's concrete topology types
-//! cross the FFI boundary cleanly. Once it holds, `Edge`/`Face`/.../`Solid`
-//! (stages 4b–4d) are the same pattern with a different inner type.
+//! - Stage 4a: `Vertex` — construct, read back its point, free.
+//! - Stage 4b (current): `Edge` — `line` / `circle_arc` (by transit or tangent)
+//!   / `bezier` constructors, `front_vertex` / `back_vertex` queries, free.
 //!
 //! All concrete topology types here come from `truck_modeling`, which already
 //! monomorphizes `Vertex<P>` / `Edge<P, C>` / `Solid<P, C, S>` to
@@ -19,7 +18,7 @@
 //! - No `let ... else` (cbindgen 0.x cannot parse it) — use `match`.
 
 use crate::handle::{self, TruckF64Array};
-use truck_modeling::{builder, Point3, Vertex};
+use truck_modeling::{builder, Edge, Point3, Vertex};
 
 /// Opaque handle to a truck `Vertex` (concrete `<Point3>` form). C sees only
 /// `typedef struct TruckVertex TruckVertex;`.
@@ -83,6 +82,169 @@ pub unsafe extern "C" fn truck_vertex_free(vertex: *mut TruckVertex) {
         None => {}
     }
 }
+
+// ===========================================================================
+// Stage 4b — Edge
+// ===========================================================================
+
+/// Opaque handle to a truck `Edge` (concrete `<Point3, Curve>` form). C sees
+/// only `typedef struct TruckEdge TruckEdge;`.
+#[derive(Debug)]
+pub struct TruckEdge(pub(crate) Edge);
+
+/// Read three `f64`s (`[x, y, z]`) from a C array, or `None` if `p` is NULL or
+/// too short.
+///
+/// # Safety
+/// `p` must be NULL or valid for `len` `f64`s.
+unsafe fn read_vec3(p: *const f64, len: usize) -> Option<[f64; 3]> {
+    if p.is_null() || len < 3 {
+        return None;
+    }
+    // SAFETY: caller guarantees p is valid for len >= 3 f64s.
+    let s = unsafe { std::slice::from_raw_parts(p, 3) };
+    Some([s[0], s[1], s[2]])
+}
+
+/// Create a straight edge (line) between two vertices. The two input vertex
+/// handles are **borrowed**, not consumed.
+///
+/// Returns a new edge handle, or NULL if either vertex is NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_edge_line(
+    v0: *const TruckVertex,
+    v1: *const TruckVertex,
+) -> *mut TruckEdge {
+    // SAFETY: caller guarantees the handles are NULL or valid.
+    let (a, b) = match (unsafe { handle::from_ref(v0) }, unsafe { handle::from_ref(v1) }) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return std::ptr::null_mut(),
+    };
+    let res = crate::error::truck_guard!(|| Ok::<Edge, crate::error::TruckError>(builder::line(&a.0, &b.0)));
+    match res {
+        Ok(edge) => handle::into_raw(TruckEdge(edge)),
+        Err(_panic) => std::ptr::null_mut(),
+    }
+}
+
+/// Create a circular-arc edge from `v0` to `v1` that passes through `transit`
+/// (`[x, y, z]`). The vertices are borrowed.
+///
+/// Returns a new edge handle, or NULL if `v0`/`v1`/`transit` is NULL/short or
+/// the three points are degenerate (collinear), in which case truck panics
+/// internally and the guard converts that to NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_edge_circle_arc_by_transit(
+    v0: *const TruckVertex,
+    v1: *const TruckVertex,
+    transit: *const f64,
+    transit_len: usize,
+) -> *mut TruckEdge {
+    // SAFETY: caller guarantees the handles are NULL or valid.
+    let (a, b) = match (unsafe { handle::from_ref(v0) }, unsafe { handle::from_ref(v1) }) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return std::ptr::null_mut(),
+    };
+    // SAFETY: caller guarantees transit is NULL or valid for transit_len f64s.
+    let [x, y, z] = match unsafe { read_vec3(transit, transit_len) } {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let res = crate::error::truck_guard!(|| {
+        Ok::<Edge, crate::error::TruckError>(builder::circle_arc(&a.0, &b.0, Point3::new(x, y, z)))
+    });
+    match res {
+        Ok(edge) => handle::into_raw(TruckEdge(edge)),
+        Err(_panic) => std::ptr::null_mut(),
+    }
+}
+
+/// Create a Bezier-curve edge from `v0` to `v1` with intermediate control
+/// points. `ctrl` is a flat array of `ctrl_len` `f64`s, i.e. `ctrl_len / 3`
+/// control points, each `[x, y, z]`. `ctrl_len` must be a multiple of 3
+/// (`ctrl` may be NULL with `ctrl_len == 0` for a straight segment).
+///
+/// The vertices are borrowed.
+///
+/// Returns a new edge handle, or NULL on NULL vertices or a non-multiple-of-3
+/// `ctrl_len`.
+#[no_mangle]
+pub unsafe extern "C" fn truck_edge_bezier(
+    v0: *const TruckVertex,
+    v1: *const TruckVertex,
+    ctrl: *const f64,
+    ctrl_len: usize,
+) -> *mut TruckEdge {
+    let (a, b) = match (unsafe { handle::from_ref(v0) }, unsafe { handle::from_ref(v1) }) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return std::ptr::null_mut(),
+    };
+    if ctrl_len % 3 != 0 {
+        return std::ptr::null_mut();
+    }
+    let points: Vec<Point3> = if ctrl.is_null() || ctrl_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: caller guarantees ctrl is valid for ctrl_len f64s.
+        let s = unsafe { std::slice::from_raw_parts(ctrl, ctrl_len) };
+        s.chunks_exact(3)
+            .map(|c| Point3::new(c[0], c[1], c[2]))
+            .collect()
+    };
+    let res = crate::error::truck_guard!(|| {
+        Ok::<Edge, crate::error::TruckError>(builder::bezier(&a.0, &b.0, points))
+    });
+    match res {
+        Ok(edge) => handle::into_raw(TruckEdge(edge)),
+        Err(_panic) => std::ptr::null_mut(),
+    }
+}
+
+/// Return the front (start) vertex of `edge` as a **new, independent** handle.
+///
+/// The returned `TruckVertex` is a clone and must be freed separately with
+/// [`truck_vertex_free`]; it is decoupled from `edge`'s lifetime.
+///
+/// Returns NULL if `edge` is NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_edge_front_vertex(edge: *const TruckEdge) -> *mut TruckVertex {
+    // SAFETY: caller guarantees edge is NULL or a valid handle.
+    let e = match unsafe { handle::from_ref(edge) } {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+    // front() borrows; clone to get an owned Vertex we can hand across FFI.
+    handle::into_raw(TruckVertex(e.0.front().clone()))
+}
+
+/// Return the back (end) vertex of `edge` as a **new, independent** handle.
+///
+/// See [`truck_edge_front_vertex`]: the result is a clone with its own lifetime.
+/// Returns NULL if `edge` is NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_edge_back_vertex(edge: *const TruckEdge) -> *mut TruckVertex {
+    // SAFETY: caller guarantees edge is NULL or a valid handle.
+    let e = match unsafe { handle::from_ref(edge) } {
+        Some(e) => e,
+        None => return std::ptr::null_mut(),
+    };
+    handle::into_raw(TruckVertex(e.0.back().clone()))
+}
+
+/// Free an edge handle. Idempotent: `truck_edge_free(NULL)` is a no-op.
+///
+/// # Safety
+/// `edge` must be NULL or a handle previously returned by truck-bridge, and
+/// must not already have been freed.
+#[no_mangle]
+pub unsafe extern "C" fn truck_edge_free(edge: *mut TruckEdge) {
+    // SAFETY: caller guarantees edge is NULL or a valid, owned handle.
+    match unsafe { handle::take_raw(edge) } {
+        Some(e) => drop(e),
+        None => {}
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -152,5 +314,133 @@ mod tests {
     fn free_null_is_safe() {
         // SAFETY: NULL is explicitly allowed.
         unsafe { truck_vertex_free(std::ptr::null_mut()) };
+    }
+
+    // ---- stage 4b: Edge ----------------------------------------------------
+
+    /// Helper: read a vertex's point into a Vec<f64>, freeing the array.
+    unsafe fn vertex_point_vec(v: *const TruckVertex) -> Vec<f64> {
+        let mut arr = TruckF64Array { ptr: std::ptr::null_mut(), len: 0 };
+        // SAFETY: v is a valid handle; arr is valid.
+        unsafe { truck_vertex_point(v, &mut arr) };
+        // SAFETY: arr.ptr valid for arr.len.
+        let s = unsafe { std::slice::from_raw_parts(arr.ptr, arr.len) }.to_vec();
+        unsafe { crate::handle::truck_f64array_free(arr) };
+        s
+    }
+
+    #[test]
+    fn edge_line_endpoints_match() {
+        let a = truck_vertex_new(1.0, 2.0, 3.0);
+        let b = truck_vertex_new(4.0, 5.0, 6.0);
+        // SAFETY: a, b are valid handles.
+        let e = unsafe { truck_edge_line(a, b) };
+        assert!(!e.is_null(), "line edge should be non-null");
+        // front should equal a, back should equal b.
+        // SAFETY: e valid.
+        let f = unsafe { truck_edge_front_vertex(e) };
+        let bk = unsafe { truck_edge_back_vertex(e) };
+        assert!(!f.is_null() && !bk.is_null());
+        assert_eq!(unsafe { vertex_point_vec(f) }, vec![1.0, 2.0, 3.0]);
+        assert_eq!(unsafe { vertex_point_vec(bk) }, vec![4.0, 5.0, 6.0]);
+        unsafe {
+            truck_vertex_free(f);
+            truck_vertex_free(bk);
+            truck_edge_free(e);
+            truck_vertex_free(a);
+            truck_vertex_free(b);
+        }
+    }
+
+    #[test]
+    fn edge_line_null_inputs() {
+        let b = truck_vertex_new(0.0, 0.0, 0.0);
+        // SAFETY: first arg NULL.
+        assert!(unsafe { truck_edge_line(std::ptr::null(), b) }.is_null());
+        // SAFETY: second arg NULL.
+        assert!(unsafe { truck_edge_line(b, std::ptr::null()) }.is_null());
+        unsafe { truck_vertex_free(b) };
+    }
+
+    #[test]
+    fn edge_circle_arc_by_transit_constructs() {
+        let a = truck_vertex_new(1.0, 0.0, 0.0);
+        let b = truck_vertex_new(-1.0, 0.0, 0.0);
+        let transit = [0.0, 1.0, 0.0]; // upper semicircle
+        // SAFETY: a, b, transit valid.
+        let e = unsafe { truck_edge_circle_arc_by_transit(a, b, transit.as_ptr(), 3) };
+        assert!(!e.is_null(), "circle arc should be non-null");
+        unsafe {
+            truck_edge_free(e);
+            truck_vertex_free(a);
+            truck_vertex_free(b);
+        }
+    }
+
+    #[test]
+    fn edge_circle_arc_null_transit_returns_null() {
+        let a = truck_vertex_new(1.0, 0.0, 0.0);
+        let b = truck_vertex_new(-1.0, 0.0, 0.0);
+        // SAFETY: NULL transit pointer.
+        let e = unsafe { truck_edge_circle_arc_by_transit(a, b, std::ptr::null(), 0) };
+        assert!(e.is_null());
+        unsafe {
+            truck_vertex_free(a);
+            truck_vertex_free(b);
+        }
+    }
+
+    #[test]
+    fn edge_bezier_constructs() {
+        let a = truck_vertex_new(0.0, 0.0, 0.0);
+        let b = truck_vertex_new(3.0, 0.0, 0.0);
+        // two intermediate control points
+        let ctrl = [1.0, 1.0, 0.0, 2.0, 1.0, 0.0];
+        // SAFETY: a, b, ctrl valid.
+        let e = unsafe { truck_edge_bezier(a, b, ctrl.as_ptr(), ctrl.len()) };
+        assert!(!e.is_null(), "bezier edge should be non-null");
+        unsafe {
+            truck_edge_free(e);
+            truck_vertex_free(a);
+            truck_vertex_free(b);
+        }
+    }
+
+    #[test]
+    fn edge_bezier_bad_length_returns_null() {
+        let a = truck_vertex_new(0.0, 0.0, 0.0);
+        let b = truck_vertex_new(1.0, 0.0, 0.0);
+        let bad = [1.0, 2.0]; // length 2, not a multiple of 3
+        // SAFETY: a, b valid; bad is valid for 2.
+        let e = unsafe { truck_edge_bezier(a, b, bad.as_ptr(), bad.len()) };
+        assert!(e.is_null(), "non-multiple-of-3 ctrl length should yield NULL");
+        unsafe {
+            truck_vertex_free(a);
+            truck_vertex_free(b);
+        }
+    }
+
+    #[test]
+    fn edge_front_back_survive_edge_free() {
+        // The cloned front/back handles must remain valid after the edge is freed.
+        let a = truck_vertex_new(1.0, 2.0, 3.0);
+        let b = truck_vertex_new(4.0, 5.0, 6.0);
+        // SAFETY: a, b valid.
+        let e = unsafe { truck_edge_line(a, b) };
+        let f = unsafe { truck_edge_front_vertex(e) };
+        unsafe { truck_edge_free(e) };
+        // f is an independent clone; querying its point must still work.
+        assert_eq!(unsafe { vertex_point_vec(f) }, vec![1.0, 2.0, 3.0]);
+        unsafe {
+            truck_vertex_free(f);
+            truck_vertex_free(a);
+            truck_vertex_free(b);
+        }
+    }
+
+    #[test]
+    fn edge_free_null_is_safe() {
+        // SAFETY: NULL is explicitly allowed.
+        unsafe { truck_edge_free(std::ptr::null_mut()) };
     }
 }

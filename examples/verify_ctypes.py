@@ -37,6 +37,12 @@ def as_u8_ptr(data: bytes):
     return cast(arr, POINTER(c_uint8)), arr  # keep arr alive across the call
 
 
+def as_f64_ptr(data):
+    """Wrap a list/array of floats as a `POINTER(c_double)` for FFI args."""
+    arr = (c_double * len(data))(*data)
+    return cast(arr, POINTER(c_double)), arr
+
+
 # --- C struct mirrors (must match include/truck_bridge.h) -------------------
 
 class TruckF64Array(Structure):
@@ -156,6 +162,19 @@ def setup(lib):
     lib.truck_vertex_point.restype = c_bool
     lib.truck_vertex_point.argtypes = [c_void_p, POINTER(TruckF64Array)]
     lib.truck_vertex_free.argtypes = [c_void_p]
+
+    # stage 4b — topology Edge
+    lib.truck_edge_line.restype = c_void_p
+    lib.truck_edge_line.argtypes = [c_void_p, c_void_p]
+    lib.truck_edge_circle_arc_by_transit.restype = c_void_p
+    lib.truck_edge_circle_arc_by_transit.argtypes = [c_void_p, c_void_p, POINTER(c_double), c_size_t]
+    lib.truck_edge_bezier.restype = c_void_p
+    lib.truck_edge_bezier.argtypes = [c_void_p, c_void_p, POINTER(c_double), c_size_t]
+    lib.truck_edge_front_vertex.restype = c_void_p
+    lib.truck_edge_front_vertex.argtypes = [c_void_p]
+    lib.truck_edge_back_vertex.restype = c_void_p
+    lib.truck_edge_back_vertex.argtypes = [c_void_p]
+    lib.truck_edge_free.argtypes = [c_void_p]
 
 
 def get_error(lib, err_ptr):
@@ -298,7 +317,56 @@ def main() -> int:
     assert not lib.truck_vertex_point(None, byref(TruckF64Array()))
     lib.truck_vertex_free(None)  # idempotent
 
-    print("\nAll ctypes checks passed (stage 2 + stage 3 + stage 4a).")
+    # --- stage 4b: topology Edge -------------------------------------------
+    va = lib.truck_vertex_new(1.0, 0.0, 0.0)
+    vb = lib.truck_vertex_new(-1.0, 0.0, 0.0)
+
+    # line + front/back endpoint roundtrip
+    e_line = lib.truck_edge_line(va, vb)
+    assert e_line, "edge_line returned NULL"
+    fv = lib.truck_edge_front_vertex(e_line)
+    bv = lib.truck_edge_back_vertex(e_line)
+    assert fv and bv
+    farr = TruckF64Array()
+    barr = TruckF64Array()
+    assert lib.truck_vertex_point(fv, byref(farr))
+    assert lib.truck_vertex_point(bv, byref(barr))
+    assert farr.values() == [1.0, 0.0, 0.0], f"front vertex mismatch: {farr.values()}"
+    assert barr.values() == [-1.0, 0.0, 0.0], f"back vertex mismatch: {barr.values()}"
+    print(f"[10] edge line: front={farr.values()}, back={barr.values()}")
+    lib.truck_f64array_free(farr)
+    lib.truck_f64array_free(barr)
+    lib.truck_vertex_free(fv)
+    lib.truck_vertex_free(bv)
+    lib.truck_edge_free(e_line)
+
+    # circle_arc by transit (upper semicircle through (0,1,0))
+    transit_ptr, _k = as_f64_ptr([0.0, 1.0, 0.0])
+    e_arc = lib.truck_edge_circle_arc_by_transit(va, vb, transit_ptr, 3)
+    assert e_arc, "edge_circle_arc_by_transit returned NULL"
+    print("[11] edge circle_arc by transit: OK")
+    lib.truck_edge_free(e_arc)
+
+    # circle_arc NULL transit -> NULL
+    assert not lib.truck_edge_circle_arc_by_transit(va, vb, None, 0)
+
+    # bezier with 2 control points
+    ctrl_ptr, _k2 = as_f64_ptr([1.0, 1.0, 0.0, 2.0, 1.0, 0.0])
+    e_bez = lib.truck_edge_bezier(va, vb, ctrl_ptr, 6)
+    assert e_bez, "edge_bezier returned NULL"
+    print("[12] edge bezier: OK")
+    lib.truck_edge_free(e_bez)
+
+    # bezier bad length (2 floats, not multiple of 3) -> NULL
+    bad_ptr, _k3 = as_f64_ptr([1.0, 2.0])
+    assert not lib.truck_edge_bezier(va, vb, bad_ptr, 2), "bezier bad length should be NULL"
+
+    # NULL vertex -> line NULL
+    assert not lib.truck_edge_line(None, vb)
+    lib.truck_vertex_free(va)
+    lib.truck_vertex_free(vb)
+
+    print("\nAll ctypes checks passed (stage 2 + stage 3 + stage 4a + stage 4b).")
     return 0
 
 
