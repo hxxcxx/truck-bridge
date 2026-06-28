@@ -4,9 +4,11 @@
 //! - Stage 4a: `Vertex` — construct, read back its point, free.
 //! - Stage 4b: `Edge` — `line` / `circle_arc` (by transit) / `bezier`
 //!   constructors, `front_vertex` / `back_vertex` queries, free.
-//! - Stage 4c (current): `Face` — `homotopy` constructor, boundary edge
-//!   count + enumeration (via the new `TruckEdgeArray` handle-array type),
-//!   free.
+//! - Stage 4c: `Face` — `homotopy` constructor, boundary edge count +
+//!   enumeration (via the `TruckEdgeArray` handle-array type), free.
+//! - Stage 4d (current): `Shell` / `Solid` — construct from sub-shapes,
+//!   tessellate to `PolygonMesh`; `AbstractShape` polymorphic handle with
+//!   `tsweep` / `rsweep` / `translated` / `rotated` / `scaled`.
 //!
 //! All concrete topology types here come from `truck_modeling`, which already
 //! monomorphizes `Vertex<P>` / `Edge<P, C>` / `Solid<P, C, S>` to
@@ -20,8 +22,11 @@
 //! - NULL inputs are rejected first; every `*_free` is idempotent / NULL-safe.
 //! - No `let ... else` (cbindgen 0.x cannot parse it) — use `match`.
 
+use crate::error::TruckError;
 use crate::handle::{self, TruckF64Array};
-use truck_modeling::{builder, Edge, Face, Point3, Vertex};
+use crate::polymesh::TruckPolygonMesh;
+use truck_meshalgo::tessellation::{MeshedShape, RobustMeshableShape};
+use truck_modeling::{builder, Edge, Face, Point3, Shell, Solid, Vector3, Vertex};
 
 /// Opaque handle to a truck `Vertex` (concrete `<Point3>` form). C sees only
 /// `typedef struct TruckVertex TruckVertex;`.
@@ -428,10 +433,662 @@ pub unsafe extern "C" fn truck_edgearray_free_all(arr: TruckEdgeArray) {
     });
 }
 
+// ===========================================================================
+// Stage 4d — Shell / Solid / AbstractShape / sweep / transform
+// ===========================================================================
+
+/// Opaque handle to a truck `Shell` (concrete `<Point3, Curve, Surface>` form).
+#[derive(Debug)]
+pub struct TruckShell(pub(crate) Shell);
+
+/// Opaque handle to a truck `Solid` (concrete `<Point3, Curve, Surface>` form).
+#[derive(Debug)]
+pub struct TruckSolid(pub(crate) Solid);
+
+/// Polymorphic topology handle — wraps any concrete topology type so that
+/// `tsweep` / `rsweep` / transform operations can accept "any shape" and
+/// return "any shape" (the result type depends on the input type).
+///
+/// Build one with `truck_{vertex,edge,face,shell,solid}_upcast`, inspect with
+/// `truck_abstractshape_is_*`, extract with `truck_abstractshape_into_*`
+/// (which consumes the `AbstractShape`).
+#[derive(Debug)]
+pub struct AbstractShape(pub(crate) SubShape);
+
+#[derive(Debug)]
+pub(crate) enum SubShape {
+    Vertex(TruckVertex),
+    Edge(TruckEdge),
+    Face(TruckFace),
+    Shell(TruckShell),
+    Solid(TruckSolid),
+}
+
+impl AbstractShape {
+    pub(crate) fn from_vertex(v: TruckVertex) -> Self {
+        AbstractShape(SubShape::Vertex(v))
+    }
+    pub(crate) fn from_edge(e: TruckEdge) -> Self {
+        AbstractShape(SubShape::Edge(e))
+    }
+    pub(crate) fn from_face(f: TruckFace) -> Self {
+        AbstractShape(SubShape::Face(f))
+    }
+    pub(crate) fn from_shell(s: TruckShell) -> Self {
+        AbstractShape(SubShape::Shell(s))
+    }
+    pub(crate) fn from_solid(s: TruckSolid) -> Self {
+        AbstractShape(SubShape::Solid(s))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell
+// ---------------------------------------------------------------------------
+
+/// Build a shell from an array of face handles. **The face handles are
+/// consumed** (moved into the shell) and must not be used or freed afterwards.
+///
+/// Returns a new shell handle on success, or NULL if `faces` is NULL or `count`
+/// is 0.
+///
+/// # Safety
+/// `faces` must be NULL or a valid array of `count` `*mut TruckFace` handles,
+/// each a valid, owned handle (none already freed/consumed).
+#[no_mangle]
+pub unsafe extern "C" fn truck_shell_from_faces(
+    faces: *const *mut TruckFace,
+    count: usize,
+) -> *mut TruckShell {
+    if faces.is_null() || count == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees faces is valid for count handle pointers.
+    let slice = unsafe { std::slice::from_raw_parts(faces, count) };
+    let mut vec = Vec::with_capacity(count);
+    for &h in slice {
+        // SAFETY: each h is an owned TruckFace handle being consumed here.
+        match unsafe { handle::take_raw(h) } {
+            Some(f) => vec.push(f.0),
+            None => return std::ptr::null_mut(),
+        }
+    }
+    handle::into_raw(TruckShell(Shell::from(vec)))
+}
+
+/// Free a shell handle. Idempotent.
+///
+/// # Safety
+/// `shell` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_shell_free(shell: *mut TruckShell) {
+    match unsafe { handle::take_raw(shell) } {
+        Some(s) => drop(s),
+        None => {}
+    }
+}
+
+/// Tessellate a shell into a `PolygonMesh` at tolerance `tol`.
+///
+/// On success writes a new mesh handle to `*out_mesh`; on failure (NULL shell,
+/// degenerate geometry) writes an error handle to `*err` and returns false.
+///
+/// # Safety
+/// `shell` must be NULL or a valid handle; `out_mesh`/`err` valid or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_shell_to_polygon(
+    shell: *const TruckShell,
+    tol: f64,
+    out_mesh: *mut *mut TruckPolygonMesh,
+    err: *mut *mut TruckError,
+) -> bool {
+    if out_mesh.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees shell is NULL or valid.
+    let s = match unsafe { handle::from_ref(shell) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let res = crate::error::truck_guard!(|| {
+        if tol <= 0.0 {
+            return Err(TruckError::new(format!("tolerance must be positive, got {tol}")));
+        }
+        let meshed = s.0.robust_triangulation(tol);
+        let polygon: truck_polymesh::PolygonMesh = meshed.to_polygon();
+        Ok::<_, TruckError>(polygon)
+    });
+    crate::truck_deliver!(res, err, |m: truck_polymesh::PolygonMesh| {
+        // SAFETY: out_mesh checked non-NULL above.
+        unsafe { *out_mesh = handle::into_raw(TruckPolygonMesh(m)) };
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Solid
+// ---------------------------------------------------------------------------
+
+/// Build a solid from an array of shell handles. **The shell handles are
+/// consumed** (moved into the solid) and must not be used or freed afterwards.
+///
+/// Returns a new solid handle, or NULL if `shells` is NULL or `count` is 0.
+///
+/// # Safety
+/// `shells` must be NULL or a valid array of `count` owned shell handles.
+#[no_mangle]
+pub unsafe extern "C" fn truck_solid_from_shells(
+    shells: *const *mut TruckShell,
+    count: usize,
+) -> *mut TruckSolid {
+    if shells.is_null() || count == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees shells is valid for count handle pointers.
+    let slice = unsafe { std::slice::from_raw_parts(shells, count) };
+    let mut vec = Vec::with_capacity(count);
+    for &h in slice {
+        match unsafe { handle::take_raw(h) } {
+            Some(s) => vec.push(s.0),
+            None => return std::ptr::null_mut(),
+        }
+    }
+    handle::into_raw(TruckSolid(Solid::new(vec)))
+}
+
+/// Free a solid handle. Idempotent.
+///
+/// # Safety
+/// `solid` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_solid_free(solid: *mut TruckSolid) {
+    match unsafe { handle::take_raw(solid) } {
+        Some(s) => drop(s),
+        None => {}
+    }
+}
+
+/// Tessellate a solid into a `PolygonMesh` at tolerance `tol` (uses the first
+/// boundary shell). See [`truck_shell_to_polygon`] for the error contract.
+///
+/// # Safety
+/// `solid` must be NULL or valid; `out_mesh`/`err` valid or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_solid_to_polygon(
+    solid: *const TruckSolid,
+    tol: f64,
+    out_mesh: *mut *mut TruckPolygonMesh,
+    err: *mut *mut TruckError,
+) -> bool {
+    if out_mesh.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees solid is NULL or valid.
+    let s = match unsafe { handle::from_ref(solid) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let res = crate::error::truck_guard!(|| {
+        if tol <= 0.0 {
+            return Err(TruckError::new(format!("tolerance must be positive, got {tol}")));
+        }
+        if s.0.boundaries().is_empty() {
+            return Err(TruckError::new("solid has no boundary shells"));
+        }
+        let meshed = s.0.robust_triangulation(tol);
+        let shell = &meshed.boundaries()[0];
+        let polygon: truck_polymesh::PolygonMesh = shell.to_polygon();
+        Ok::<_, TruckError>(polygon)
+    });
+    crate::truck_deliver!(res, err, |m: truck_polymesh::PolygonMesh| {
+        // SAFETY: out_mesh checked non-NULL above.
+        unsafe { *out_mesh = handle::into_raw(TruckPolygonMesh(m)) };
+    })
+}
+
+// ---------------------------------------------------------------------------
+// AbstractShape — upcast / inspect / downcast
+// ---------------------------------------------------------------------------
+
+/// Wrap a vertex into an `AbstractShape`. The vertex handle is consumed.
+///
+/// # Safety
+/// `v` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_vertex_upcast(v: *mut TruckVertex) -> *mut AbstractShape {
+    match unsafe { handle::take_raw(v) } {
+        Some(v) => handle::into_raw(AbstractShape::from_vertex(v)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Wrap an edge into an `AbstractShape`. The edge handle is consumed.
+///
+/// # Safety
+/// `e` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_edge_upcast(e: *mut TruckEdge) -> *mut AbstractShape {
+    match unsafe { handle::take_raw(e) } {
+        Some(e) => handle::into_raw(AbstractShape::from_edge(e)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Wrap a face into an `AbstractShape`. The face handle is consumed.
+///
+/// # Safety
+/// `f` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_face_upcast(f: *mut TruckFace) -> *mut AbstractShape {
+    match unsafe { handle::take_raw(f) } {
+        Some(f) => handle::into_raw(AbstractShape::from_face(f)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Wrap a shell into an `AbstractShape`. The shell handle is consumed.
+///
+/// # Safety
+/// `s` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_shell_upcast(s: *mut TruckShell) -> *mut AbstractShape {
+    match unsafe { handle::take_raw(s) } {
+        Some(s) => handle::into_raw(AbstractShape::from_shell(s)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Wrap a solid into an `AbstractShape`. The solid handle is consumed.
+///
+/// # Safety
+/// `s` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_solid_upcast(s: *mut TruckSolid) -> *mut AbstractShape {
+    match unsafe { handle::take_raw(s) } {
+        Some(s) => handle::into_raw(AbstractShape::from_solid(s)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Returns true if `shape` wraps a vertex.
+///
+/// # Safety
+/// `shape` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_is_vertex(shape: *const AbstractShape) -> bool {
+    matches!(unsafe { handle::from_ref(shape) }.map(|s| &s.0), Some(SubShape::Vertex(_)))
+}
+
+/// Returns true if `shape` wraps an edge.
+///
+/// # Safety
+/// `shape` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_is_edge(shape: *const AbstractShape) -> bool {
+    matches!(unsafe { handle::from_ref(shape) }.map(|s| &s.0), Some(SubShape::Edge(_)))
+}
+
+/// Returns true if `shape` wraps a face.
+///
+/// # Safety
+/// `shape` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_is_face(shape: *const AbstractShape) -> bool {
+    matches!(unsafe { handle::from_ref(shape) }.map(|s| &s.0), Some(SubShape::Face(_)))
+}
+
+/// Returns true if `shape` wraps a shell.
+///
+/// # Safety
+/// `shape` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_is_shell(shape: *const AbstractShape) -> bool {
+    matches!(unsafe { handle::from_ref(shape) }.map(|s| &s.0), Some(SubShape::Shell(_)))
+}
+
+/// Returns true if `shape` wraps a solid.
+///
+/// # Safety
+/// `shape` must be NULL or a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_is_solid(shape: *const AbstractShape) -> bool {
+    matches!(unsafe { handle::from_ref(shape) }.map(|s| &s.0), Some(SubShape::Solid(_)))
+}
+
+/// Consume `shape` and return the wrapped vertex, or NULL if it is not a vertex
+/// (the `AbstractShape` is consumed regardless).
+///
+/// # Safety
+/// `shape` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_into_vertex(
+    shape: *mut AbstractShape,
+) -> *mut TruckVertex {
+    match unsafe { handle::take_raw(shape) }.map(|s| s.0) {
+        Some(SubShape::Vertex(v)) => handle::into_raw(v),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Consume `shape` and return the wrapped edge, or NULL if not an edge.
+///
+/// # Safety
+/// `shape` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_into_edge(
+    shape: *mut AbstractShape,
+) -> *mut TruckEdge {
+    match unsafe { handle::take_raw(shape) }.map(|s| s.0) {
+        Some(SubShape::Edge(e)) => handle::into_raw(e),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Consume `shape` and return the wrapped face, or NULL if not a face.
+///
+/// # Safety
+/// `shape` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_into_face(
+    shape: *mut AbstractShape,
+) -> *mut TruckFace {
+    match unsafe { handle::take_raw(shape) }.map(|s| s.0) {
+        Some(SubShape::Face(f)) => handle::into_raw(f),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Consume `shape` and return the wrapped shell, or NULL if not a shell.
+///
+/// # Safety
+/// `shape` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_into_shell(
+    shape: *mut AbstractShape,
+) -> *mut TruckShell {
+    match unsafe { handle::take_raw(shape) }.map(|s| s.0) {
+        Some(SubShape::Shell(s)) => handle::into_raw(s),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Consume `shape` and return the wrapped solid, or NULL if not a solid.
+///
+/// # Safety
+/// `shape` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_into_solid(
+    shape: *mut AbstractShape,
+) -> *mut TruckSolid {
+    match unsafe { handle::take_raw(shape) }.map(|s| s.0) {
+        Some(SubShape::Solid(s)) => handle::into_raw(s),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Free an `AbstractShape` handle. Idempotent.
+///
+/// # Safety
+/// `shape` must be NULL or a valid, owned handle.
+#[no_mangle]
+pub unsafe extern "C" fn truck_abstractshape_free(shape: *mut AbstractShape) {
+    match unsafe { handle::take_raw(shape) } {
+        Some(s) => drop(s),
+        None => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sweep + transform (operate on AbstractShape)
+// ---------------------------------------------------------------------------
+
+/// Sweep `shape` by translation vector `vec` (`[x, y, z]`).
+///
+/// Result type depends on input (truck 0.6.0 `Sweep` mapping):
+/// vertex→edge, edge→face, face→solid. Sweeping a shell or solid is an error
+/// (shell sweep yields multiple solids; solid cannot be swept).
+///
+/// On success writes a new `AbstractShape` to `*out`; on failure writes an
+/// error handle to `*err`.
+///
+/// # Safety
+/// `shape` must be NULL or valid; `vec` must be NULL or valid for `vec_len`
+/// f64s; `out`/`err` valid or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_tsweep(
+    shape: *const AbstractShape,
+    vec: *const f64,
+    vec_len: usize,
+    out: *mut *mut AbstractShape,
+    err: *mut *mut TruckError,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees shape is NULL or valid.
+    let s = match unsafe { handle::from_ref(shape) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let v = match unsafe { read_vec3(vec, vec_len) } {
+        Some(v) => Vector3::new(v[0], v[1], v[2]),
+        None => {
+            if !err.is_null() {
+                // SAFETY: err points to writable storage.
+                unsafe { *err = handle::into_raw(TruckError::new("vec must be 3 f64s")) };
+            }
+            return false;
+        }
+    };
+    let res = crate::error::truck_guard!(|| -> Result<AbstractShape, TruckError> {
+        Ok(match &s.0 {
+            SubShape::Vertex(vx) => AbstractShape::from_edge(TruckEdge(builder::tsweep(&vx.0, v))),
+            SubShape::Edge(e) => AbstractShape::from_face(TruckFace(builder::tsweep(&e.0, v))),
+            SubShape::Face(f) => AbstractShape::from_solid(TruckSolid(builder::tsweep(&f.0, v))),
+            SubShape::Shell(_) => {
+                return Err(TruckError::new("cannot tsweep a Shell (multi-result)"));
+            }
+            SubShape::Solid(_) => {
+                return Err(TruckError::new("cannot tsweep a Solid"));
+            }
+        })
+    });
+    crate::truck_deliver!(res, err, |a: AbstractShape| {
+        // SAFETY: out checked non-NULL above.
+        unsafe { *out = handle::into_raw(a) };
+    })
+}
+
+/// Sweep `shape` by rotation about `axis` through `origin` by `angle` radians.
+///
+/// `axis` must be normalized. truck 0.6.0 `rsweep` (via `ClosedSweep`) maps:
+/// edge→shell, face→solid. Rotating a vertex/shell/solid is unsupported (the
+/// result would be a Wire/multi-solid, which this ABI does not expose).
+///
+/// # Safety
+/// `shape`, `origin`, `axis` NULL-or-valid; `out`/`err` valid or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_rsweep(
+    shape: *const AbstractShape,
+    origin: *const f64,
+    origin_len: usize,
+    axis: *const f64,
+    axis_len: usize,
+    angle: f64,
+    out: *mut *mut AbstractShape,
+    err: *mut *mut TruckError,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let s = match unsafe { handle::from_ref(shape) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let o = match unsafe { read_vec3(origin, origin_len) } {
+        Some(o) => Point3::new(o[0], o[1], o[2]),
+        None => return false,
+    };
+    let a = match unsafe { read_vec3(axis, axis_len) } {
+        Some(a) => Vector3::new(a[0], a[1], a[2]),
+        None => return false,
+    };
+    let res = crate::error::truck_guard!(|| -> Result<AbstractShape, TruckError> {
+        Ok(match &s.0 {
+            SubShape::Edge(e) => AbstractShape::from_shell(TruckShell(builder::rsweep(
+                &e.0, o, a, truck_modeling::Rad(angle),
+            ))),
+            SubShape::Face(f) => AbstractShape::from_solid(TruckSolid(builder::rsweep(
+                &f.0, o, a, truck_modeling::Rad(angle),
+            ))),
+            SubShape::Vertex(_) => {
+                return Err(TruckError::new("rsweep of a Vertex yields a Wire, not exposed"));
+            }
+            SubShape::Shell(_) | SubShape::Solid(_) => {
+                return Err(TruckError::new("cannot rsweep a Shell or Solid"));
+            }
+        })
+    });
+    crate::truck_deliver!(res, err, |a: AbstractShape| {
+        // SAFETY: out checked non-NULL above.
+        unsafe { *out = handle::into_raw(a) };
+    })
+}
+
+/// Translate `shape` by `vec` (`[x, y, z]`); returns the same shape type.
+///
+/// # Safety
+/// `shape`/`vec` NULL-or-valid; `out`/`err` valid or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn truck_translated(
+    shape: *const AbstractShape,
+    vec: *const f64,
+    vec_len: usize,
+    out: *mut *mut AbstractShape,
+    err: *mut *mut TruckError,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let s = match unsafe { handle::from_ref(shape) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let v = match unsafe { read_vec3(vec, vec_len) } {
+        Some(v) => Vector3::new(v[0], v[1], v[2]),
+        None => return false,
+    };
+    let res = crate::error::truck_guard!(|| -> Result<AbstractShape, TruckError> {
+        Ok(match &s.0 {
+            SubShape::Vertex(vx) => AbstractShape::from_vertex(TruckVertex(builder::translated(&vx.0, v))),
+            SubShape::Edge(e) => AbstractShape::from_edge(TruckEdge(builder::translated(&e.0, v))),
+            SubShape::Face(f) => AbstractShape::from_face(TruckFace(builder::translated(&f.0, v))),
+            SubShape::Shell(sh) => AbstractShape::from_shell(TruckShell(builder::translated(&sh.0, v))),
+            SubShape::Solid(so) => AbstractShape::from_solid(TruckSolid(builder::translated(&so.0, v))),
+        })
+    });
+    crate::truck_deliver!(res, err, |a: AbstractShape| {
+        // SAFETY: out checked non-NULL above.
+        unsafe { *out = handle::into_raw(a) };
+    })
+}
+
+/// Rotate `shape` about `axis` through `origin` by `angle` radians; same type.
+/// `axis` must be normalized.
+///
+/// # Safety
+/// All pointer args NULL-or-valid per their roles.
+#[no_mangle]
+pub unsafe extern "C" fn truck_rotated(
+    shape: *const AbstractShape,
+    origin: *const f64,
+    origin_len: usize,
+    axis: *const f64,
+    axis_len: usize,
+    angle: f64,
+    out: *mut *mut AbstractShape,
+    err: *mut *mut TruckError,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let s = match unsafe { handle::from_ref(shape) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let o = match unsafe { read_vec3(origin, origin_len) } {
+        Some(o) => Point3::new(o[0], o[1], o[2]),
+        None => return false,
+    };
+    let a = match unsafe { read_vec3(axis, axis_len) } {
+        Some(a) => Vector3::new(a[0], a[1], a[2]),
+        None => return false,
+    };
+    let res = crate::error::truck_guard!(|| -> Result<AbstractShape, TruckError> {
+        Ok(match &s.0 {
+            SubShape::Vertex(vx) => AbstractShape::from_vertex(TruckVertex(builder::rotated(&vx.0, o, a, truck_modeling::Rad(angle)))),
+            SubShape::Edge(e) => AbstractShape::from_edge(TruckEdge(builder::rotated(&e.0, o, a, truck_modeling::Rad(angle)))),
+            SubShape::Face(f) => AbstractShape::from_face(TruckFace(builder::rotated(&f.0, o, a, truck_modeling::Rad(angle)))),
+            SubShape::Shell(sh) => AbstractShape::from_shell(TruckShell(builder::rotated(&sh.0, o, a, truck_modeling::Rad(angle)))),
+            SubShape::Solid(so) => AbstractShape::from_solid(TruckSolid(builder::rotated(&so.0, o, a, truck_modeling::Rad(angle)))),
+        })
+    });
+    crate::truck_deliver!(res, err, |a: AbstractShape| {
+        // SAFETY: out checked non-NULL above.
+        unsafe { *out = handle::into_raw(a) };
+    })
+}
+
+/// Scale `shape` about `origin` by `scalars` (`[sx, sy, sz]`); same type.
+///
+/// # Safety
+/// All pointer args NULL-or-valid per their roles.
+#[no_mangle]
+pub unsafe extern "C" fn truck_scaled(
+    shape: *const AbstractShape,
+    origin: *const f64,
+    origin_len: usize,
+    scalars: *const f64,
+    scalars_len: usize,
+    out: *mut *mut AbstractShape,
+    err: *mut *mut TruckError,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let s = match unsafe { handle::from_ref(shape) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let o = match unsafe { read_vec3(origin, origin_len) } {
+        Some(o) => Point3::new(o[0], o[1], o[2]),
+        None => return false,
+    };
+    let sc = match unsafe { read_vec3(scalars, scalars_len) } {
+        Some(sc) => Vector3::new(sc[0], sc[1], sc[2]),
+        None => return false,
+    };
+    let res = crate::error::truck_guard!(|| -> Result<AbstractShape, TruckError> {
+        Ok(match &s.0 {
+            SubShape::Vertex(vx) => AbstractShape::from_vertex(TruckVertex(builder::scaled(&vx.0, o, sc))),
+            SubShape::Edge(e) => AbstractShape::from_edge(TruckEdge(builder::scaled(&e.0, o, sc))),
+            SubShape::Face(f) => AbstractShape::from_face(TruckFace(builder::scaled(&f.0, o, sc))),
+            SubShape::Shell(sh) => AbstractShape::from_shell(TruckShell(builder::scaled(&sh.0, o, sc))),
+            SubShape::Solid(so) => AbstractShape::from_solid(TruckSolid(builder::scaled(&so.0, o, sc))),
+        })
+    });
+    crate::truck_deliver!(res, err, |a: AbstractShape| {
+        // SAFETY: out checked non-NULL above.
+        unsafe { *out = handle::into_raw(a) };
+    })
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Bring helpers into scope for the 4d tessellation/error tests.
+    use crate::error::truck_error_free;
+    use crate::polymesh::truck_polygonmesh_free;
 
     #[test]
     fn new_is_non_null() {
@@ -736,5 +1393,228 @@ mod tests {
         unsafe { truck_edgearray_free_all(TruckEdgeArray::empty()) };
         // SAFETY: empty value is explicitly allowed.
         unsafe { truck_edgearray_free(TruckEdgeArray::empty()) };
+    }
+
+    // ---- stage 4d-0: meshalgo compatibility smoke test ---------------------
+    // Go/no-go gate: verifies that truck_modeling 0.6.0's Curve/Surface satisfy
+    // truck_meshalgo 0.4.0's PolylineableCurve/MeshableSurface bounds, by
+    // driving the full builder chain vertex -> edge -> face -> solid and then
+    // tessellating the solid into a PolygonMesh. If this compiles AND runs, the
+    // version combination is compatible and stage 4d-1 can proceed.
+    #[test]
+    fn meshalgo_compatibility_smoke() {
+        use truck_meshalgo::tessellation::{MeshedShape, RobustMeshableShape};
+
+        let v: truck_modeling::Vertex = truck_modeling::builder::vertex(Point3::new(0.0, 0.0, 0.0));
+        let e: truck_modeling::Edge =
+            truck_modeling::builder::tsweep(&v, truck_modeling::Vector3::new(1.0, 0.0, 0.0));
+        let f: truck_modeling::Face =
+            truck_modeling::builder::tsweep(&e, truck_modeling::Vector3::new(0.0, 1.0, 0.0));
+        let s: truck_modeling::Solid =
+            truck_modeling::builder::tsweep(&f, truck_modeling::Vector3::new(0.0, 0.0, 1.0));
+
+        // Tessellate the solid's first boundary shell into a polygon mesh.
+        let meshed = s.robust_triangulation(0.01);
+        let shell = &meshed.boundaries()[0];
+        let polygon: truck_polymesh::PolygonMesh = shell.to_polygon();
+        assert!(!polygon.positions().is_empty(), "tessellated mesh should have positions");
+    }
+
+    // ---- stage 4d-1: Shell / Solid / AbstractShape / sweep -----------------
+
+    #[test]
+    fn tsweep_chain_vertex_to_solid() {
+        // vertex -> edge -> face -> solid, each via AbstractShape.
+        let v = truck_vertex_new(0.0, 0.0, 0.0);
+        let vec_x = [1.0, 0.0, 0.0];
+        // SAFETY: v valid.
+        let s0 = unsafe { truck_vertex_upcast(v) };
+        assert!(!s0.is_null());
+
+        let mut s1 = std::ptr::null_mut();
+        let mut err = std::ptr::null_mut();
+        // SAFETY: s0 valid; vec_x valid.
+        let ok = unsafe { truck_tsweep(s0, vec_x.as_ptr(), 3, &mut s1, &mut err) };
+        assert!(ok, "vertex tsweep should succeed");
+        // SAFETY: s1 valid.
+        assert!(unsafe { truck_abstractshape_is_edge(s1) });
+
+        let mut s2 = std::ptr::null_mut();
+        let vec_y = [0.0, 1.0, 0.0];
+        // SAFETY: s1 valid; vec_y valid.
+        assert!(unsafe { truck_tsweep(s1, vec_y.as_ptr(), 3, &mut s2, &mut err) });
+        // SAFETY: s2 valid.
+        assert!(unsafe { truck_abstractshape_is_face(s2) });
+
+        let mut s3 = std::ptr::null_mut();
+        let vec_z = [0.0, 0.0, 1.0];
+        // SAFETY: s2 valid; vec_z valid.
+        assert!(unsafe { truck_tsweep(s2, vec_z.as_ptr(), 3, &mut s3, &mut err) });
+        // SAFETY: s3 valid.
+        assert!(unsafe { truck_abstractshape_is_solid(s3) });
+
+        unsafe {
+            truck_abstractshape_free(s3);
+            truck_abstractshape_free(s2);
+            truck_abstractshape_free(s1);
+            truck_abstractshape_free(s0);
+        }
+    }
+
+    #[test]
+    fn tsweep_solid_is_error() {
+        let v = truck_vertex_new(0.0, 0.0, 0.0);
+        // SAFETY: v valid.
+        let s0 = unsafe { truck_vertex_upcast(v) };
+        let mut s1 = std::ptr::null_mut();
+        let mut err = std::ptr::null_mut();
+        let vec = [1.0, 0.0, 0.0];
+        // SAFETY: s0 valid.
+        unsafe { truck_tsweep(s0, vec.as_ptr(), 3, &mut s1, &mut err) }; // vertex->edge
+        let mut s2 = std::ptr::null_mut();
+        unsafe { truck_tsweep(s1, [0.0, 1.0, 0.0].as_ptr(), 3, &mut s2, &mut err) }; // edge->face
+        let mut s3 = std::ptr::null_mut();
+        unsafe { truck_tsweep(s2, [0.0, 0.0, 1.0].as_ptr(), 3, &mut s3, &mut err) }; // face->solid
+
+        // tsweep a solid -> error
+        let mut s4 = std::ptr::null_mut();
+        err = std::ptr::null_mut();
+        // SAFETY: s3 valid (a solid).
+        let ok = unsafe { truck_tsweep(s3, [1.0, 0.0, 0.0].as_ptr(), 3, &mut s4, &mut err) };
+        assert!(!ok, "tsweep of a solid should fail");
+        assert!(!err.is_null());
+        unsafe {
+            truck_error_free(err);
+            truck_abstractshape_free(s4);
+            truck_abstractshape_free(s3);
+            truck_abstractshape_free(s2);
+            truck_abstractshape_free(s1);
+            truck_abstractshape_free(s0);
+        }
+    }
+
+    #[test]
+    fn solid_to_polygon_via_tsweep() {
+        // vertex -> edge -> face -> solid, then tessellate the solid.
+        let v = truck_vertex_new(0.0, 0.0, 0.0);
+        // SAFETY: v valid.
+        let s0 = unsafe { truck_vertex_upcast(v) };
+        let mut s1 = std::ptr::null_mut();
+        let mut s2 = std::ptr::null_mut();
+        let mut s3 = std::ptr::null_mut();
+        let mut err = std::ptr::null_mut();
+        // SAFETY: chain of valid shapes; tsweep borrows input, so s0/s1/s2 stay alive.
+        unsafe {
+            truck_tsweep(s0, [1.0, 0.0, 0.0].as_ptr(), 3, &mut s1, &mut err);
+            truck_tsweep(s1, [0.0, 1.0, 0.0].as_ptr(), 3, &mut s2, &mut err);
+            truck_tsweep(s2, [0.0, 0.0, 1.0].as_ptr(), 3, &mut s3, &mut err);
+        }
+        // s3 wraps a solid; extract it (consumes s3).
+        // SAFETY: s3 valid (a solid).
+        let solid = unsafe { truck_abstractshape_into_solid(s3) };
+        assert!(!solid.is_null());
+
+        let mut mesh: *mut TruckPolygonMesh = std::ptr::null_mut();
+        let mut err2 = std::ptr::null_mut();
+        // SAFETY: solid valid.
+        let ok = unsafe { truck_solid_to_polygon(solid, 0.01, &mut mesh, &mut err2) };
+        assert!(ok, "solid_to_polygon should succeed");
+        assert!(!mesh.is_null());
+        unsafe {
+            truck_polygonmesh_free(mesh);
+            truck_solid_free(solid);
+            truck_abstractshape_free(s2);
+            truck_abstractshape_free(s1);
+            truck_abstractshape_free(s0);
+        }
+    }
+
+    #[test]
+    fn shell_from_faces_and_to_polygon() {
+        // Build a face via homotopy, wrap in a shell, tessellate the shell.
+        let v0 = truck_vertex_new(0.0, 0.0, 0.0);
+        let v1 = truck_vertex_new(1.0, 0.0, 0.0);
+        let v2 = truck_vertex_new(0.0, 0.0, 1.0);
+        let v3 = truck_vertex_new(1.0, 0.0, 1.0);
+        // SAFETY: vertices valid.
+        let e0 = unsafe { truck_edge_line(v0, v1) };
+        let e1 = unsafe { truck_edge_line(v2, v3) };
+        // SAFETY: edges valid.
+        let face = unsafe { truck_face_homotopy(e0, e1) };
+        let faces = [face];
+        // SAFETY: faces array valid; face consumed.
+        let shell = unsafe { truck_shell_from_faces(faces.as_ptr(), 1) };
+        assert!(!shell.is_null());
+
+        let mut mesh: *mut TruckPolygonMesh = std::ptr::null_mut();
+        let mut err = std::ptr::null_mut();
+        // SAFETY: shell valid.
+        let ok = unsafe { truck_shell_to_polygon(shell, 0.01, &mut mesh, &mut err) };
+        assert!(ok, "shell_to_polygon should succeed");
+        assert!(!mesh.is_null());
+        unsafe {
+            truck_polygonmesh_free(mesh);
+            truck_shell_free(shell);
+            truck_edge_free(e0);
+            truck_edge_free(e1);
+            truck_vertex_free(v0);
+            truck_vertex_free(v1);
+            truck_vertex_free(v2);
+            truck_vertex_free(v3);
+        }
+    }
+
+    #[test]
+    fn translated_preserves_type() {
+        let v = truck_vertex_new(0.0, 0.0, 0.0);
+        // SAFETY: v valid.
+        let s = unsafe { truck_vertex_upcast(v) };
+        let mut out = std::ptr::null_mut();
+        let mut err = std::ptr::null_mut();
+        let vec = [5.0, 0.0, 0.0];
+        // SAFETY: s valid; vec valid.
+        let ok = unsafe { truck_translated(s, vec.as_ptr(), 3, &mut out, &mut err) };
+        assert!(ok);
+        // SAFETY: out valid.
+        assert!(unsafe { truck_abstractshape_is_vertex(out) });
+        // extract vertex and check its point moved
+        // SAFETY: out valid (a vertex).
+        let mv = unsafe { truck_abstractshape_into_vertex(out) };
+        let mut arr = TruckF64Array { ptr: std::ptr::null_mut(), len: 0 };
+        // SAFETY: mv valid.
+        unsafe { truck_vertex_point(mv, &mut arr) };
+        // SAFETY: arr valid for len.
+        let pts = unsafe { std::slice::from_raw_parts(arr.ptr, arr.len) };
+        assert_eq!(pts, &[5.0, 0.0, 0.0]);
+        unsafe {
+            crate::handle::truck_f64array_free(arr);
+            truck_vertex_free(mv);
+            truck_abstractshape_free(s);
+        }
+    }
+
+    #[test]
+    fn abstractshape_into_wrong_type_yields_null() {
+        let v = truck_vertex_new(0.0, 0.0, 0.0);
+        // SAFETY: v valid.
+        let s = unsafe { truck_vertex_upcast(v) };
+        // into_edge on a vertex-shape -> NULL, shape still consumed
+        // SAFETY: s valid.
+        let edge = unsafe { truck_abstractshape_into_edge(s) };
+        assert!(edge.is_null());
+        // SAFETY: NULL is fine to free.
+        unsafe { truck_edge_free(edge) };
+    }
+
+    #[test]
+    fn shell_solid_free_null_safe() {
+        // SAFETY: NULL is explicitly allowed.
+        unsafe {
+            truck_shell_free(std::ptr::null_mut());
+            truck_solid_free(std::ptr::null_mut());
+            truck_abstractshape_free(std::ptr::null_mut());
+            truck_vertex_upcast(std::ptr::null_mut());
+            truck_edge_upcast(std::ptr::null_mut());
+        }
     }
 }

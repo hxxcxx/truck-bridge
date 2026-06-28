@@ -43,6 +43,12 @@ def as_f64_ptr(data):
     return cast(arr, POINTER(c_double)), arr
 
 
+def as_void_ptr_arr(handles):
+    """Wrap a list of integer handles as a `POINTER(c_void_p)` for FFI arrays."""
+    arr = (c_void_p * len(handles))(*handles)
+    return cast(arr, POINTER(c_void_p)), arr
+
+
 # --- C struct mirrors (must match include/truck_bridge.h) -------------------
 
 class TruckF64Array(Structure):
@@ -196,6 +202,52 @@ def setup(lib):
     lib.truck_face_free.argtypes = [c_void_p]
     lib.truck_edgearray_free.argtypes = [TruckEdgeArray]
     lib.truck_edgearray_free_all.argtypes = [TruckEdgeArray]
+
+    # stage 4d — Shell / Solid / AbstractShape / sweep / transform
+    lib.truck_shell_from_faces.restype = c_void_p
+    lib.truck_shell_from_faces.argtypes = [POINTER(c_void_p), c_size_t]
+    lib.truck_shell_free.argtypes = [c_void_p]
+    lib.truck_shell_to_polygon.restype = c_bool
+    lib.truck_shell_to_polygon.argtypes = [c_void_p, c_double, POINTER(c_void_p), POINTER(c_void_p)]
+    lib.truck_solid_from_shells.restype = c_void_p
+    lib.truck_solid_from_shells.argtypes = [POINTER(c_void_p), c_size_t]
+    lib.truck_solid_free.argtypes = [c_void_p]
+    lib.truck_solid_to_polygon.restype = c_bool
+    lib.truck_solid_to_polygon.argtypes = [c_void_p, c_double, POINTER(c_void_p), POINTER(c_void_p)]
+
+    lib.truck_vertex_upcast.restype = c_void_p
+    lib.truck_vertex_upcast.argtypes = [c_void_p]
+    lib.truck_edge_upcast.restype = c_void_p
+    lib.truck_edge_upcast.argtypes = [c_void_p]
+    lib.truck_face_upcast.restype = c_void_p
+    lib.truck_face_upcast.argtypes = [c_void_p]
+    lib.truck_shell_upcast.restype = c_void_p
+    lib.truck_shell_upcast.argtypes = [c_void_p]
+    lib.truck_solid_upcast.restype = c_void_p
+    lib.truck_solid_upcast.argtypes = [c_void_p]
+
+    lib.truck_abstractshape_is_vertex.restype = c_bool
+    lib.truck_abstractshape_is_vertex.argtypes = [c_void_p]
+    lib.truck_abstractshape_is_edge.restype = c_bool
+    lib.truck_abstractshape_is_edge.argtypes = [c_void_p]
+    lib.truck_abstractshape_is_face.restype = c_bool
+    lib.truck_abstractshape_is_face.argtypes = [c_void_p]
+    lib.truck_abstractshape_is_shell.restype = c_bool
+    lib.truck_abstractshape_is_shell.argtypes = [c_void_p]
+    lib.truck_abstractshape_is_solid.restype = c_bool
+    lib.truck_abstractshape_is_solid.argtypes = [c_void_p]
+    lib.truck_abstractshape_into_solid.restype = c_void_p
+    lib.truck_abstractshape_into_solid.argtypes = [c_void_p]
+    lib.truck_abstractshape_into_vertex.restype = c_void_p
+    lib.truck_abstractshape_into_vertex.argtypes = [c_void_p]
+    lib.truck_abstractshape_free.argtypes = [c_void_p]
+
+    lib.truck_tsweep.restype = c_bool
+    lib.truck_tsweep.argtypes = [c_void_p, POINTER(c_double), c_size_t, POINTER(c_void_p), POINTER(c_void_p)]
+    lib.truck_rsweep.restype = c_bool
+    lib.truck_rsweep.argtypes = [c_void_p, POINTER(c_double), c_size_t, POINTER(c_double), c_size_t, c_double, POINTER(c_void_p), POINTER(c_void_p)]
+    lib.truck_translated.restype = c_bool
+    lib.truck_translated.argtypes = [c_void_p, POINTER(c_double), c_size_t, POINTER(c_void_p), POINTER(c_void_p)]
 
 
 def get_error(lib, err_ptr):
@@ -424,7 +476,79 @@ def main() -> int:
     lib.truck_vertex_free(f_v2)
     lib.truck_vertex_free(f_v3)
 
-    print("\nAll ctypes checks passed (stage 2 + 3 + 4a + 4b + 4c).")
+    # --- stage 4d: Solid + sweep + to_polygon (end-to-end) -----------------
+    # vertex -> tsweep -> edge -> tsweep -> face -> tsweep -> solid -> mesh
+    sv = lib.truck_vertex_new(0.0, 0.0, 0.0)
+    shape0 = lib.truck_vertex_upcast(sv)
+    assert shape0
+
+    out_shape = c_void_p()
+    err = c_void_p()
+    vx_ptr, _k = as_f64_ptr([1.0, 0.0, 0.0])
+    assert lib.truck_tsweep(shape0, vx_ptr, 3, byref(out_shape), byref(err)), "vertex tsweep"
+    shape1 = out_shape.value
+    assert lib.truck_abstractshape_is_edge(shape1), "vertex tsweep -> edge"
+
+    out_shape = c_void_p()
+    vy_ptr, _k2 = as_f64_ptr([0.0, 1.0, 0.0])
+    assert lib.truck_tsweep(shape1, vy_ptr, 3, byref(out_shape), byref(err)), "edge tsweep"
+    shape2 = out_shape.value
+    assert lib.truck_abstractshape_is_face(shape2), "edge tsweep -> face"
+
+    out_shape = c_void_p()
+    vz_ptr, _k3 = as_f64_ptr([0.0, 0.0, 1.0])
+    assert lib.truck_tsweep(shape2, vz_ptr, 3, byref(out_shape), byref(err)), "face tsweep"
+    shape3 = out_shape.value
+    assert lib.truck_abstractshape_is_solid(shape3), "face tsweep -> solid"
+    print("[15] tsweep chain: vertex -> edge -> face -> solid")
+
+    # extract solid and tessellate
+    solid = lib.truck_abstractshape_into_solid(shape3)
+    assert solid, "into_solid should return the solid"
+    mesh_out = c_void_p()
+    err = c_void_p()
+    assert lib.truck_solid_to_polygon(solid, 0.01, byref(mesh_out), byref(err)), "solid_to_polygon"
+    assert mesh_out.value, "mesh should be non-null"
+    # verify the mesh has geometry via bounding box
+    bbox = TruckF64Array()
+    assert lib.truck_polygonmesh_bounding_box(mesh_out.value, byref(bbox))
+    bb = bbox.values()
+    assert all(not math.isinf(v) for v in bb), f"cube bbox should be finite: {bb}"
+    print(f"[16] solid_to_polygon: cube bbox = {bb}")
+    lib.truck_f64array_free(bbox)
+    lib.truck_polygonmesh_free(mesh_out.value)
+    lib.truck_solid_free(solid)
+
+    # tsweep a solid -> error
+    err = c_void_p()
+    bad_out = c_void_p()
+    assert not lib.truck_tsweep(shape3, vx_ptr, 3, byref(bad_out), byref(err)), "tsweep solid should fail"
+    msg = get_error(lib, err.value)
+    assert msg, "expected error message"
+
+    # translated: vertex -> translated vertex, point moves
+    tv = lib.truck_vertex_new(0.0, 0.0, 0.0)
+    tshape = lib.truck_vertex_upcast(tv)
+    tout = c_void_p()
+    err = c_void_p()
+    tvec_ptr, _k4 = as_f64_ptr([5.0, 0.0, 0.0])
+    assert lib.truck_translated(tshape, tvec_ptr, 3, byref(tout), byref(err))
+    assert lib.truck_abstractshape_is_vertex(tout.value)
+    tvert = lib.truck_abstractshape_into_vertex(tout.value)
+    tarr = TruckF64Array()
+    lib.truck_vertex_point(tvert, byref(tarr))
+    assert tarr.values() == [5.0, 0.0, 0.0], f"translated vertex: {tarr.values()}"
+    print("[17] translated: vertex moved to [5,0,0]")
+    lib.truck_f64array_free(tarr)
+    lib.truck_vertex_free(tvert)
+    lib.truck_abstractshape_free(tshape)
+
+    # cleanup the tsweep chain (shape0/1/2 borrowed, still alive)
+    lib.truck_abstractshape_free(shape0)
+    lib.truck_abstractshape_free(shape1)
+    lib.truck_abstractshape_free(shape2)
+
+    print("\nAll ctypes checks passed (stage 2 + 3 + 4a + 4b + 4c + 4d).")
     return 0
 
 
